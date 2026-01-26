@@ -500,9 +500,21 @@ def map(f, x):
 				if type(x)==str:
 					f,x=x,f
 				if type(x) in (list,tuple):
+					# We have a string "getter" and a list of stuff
+
 					if len(x) == 0:
 						return [] if type(x)==list else tuple()
-					n = [getattr(e, f)() for e in x]
+
+					# Originally, I had the getattr result being *called*
+					# here. idk why. wouldn't we just wanna get it?
+					# I'm sure something will break later...
+					# n = [getattr(e, f)() for e in x]
+					def _flex_get(e, f):
+						if isinstance(e, dict):
+							return e[f]
+						else:
+							return getattr(e, f)
+					n = [_flex_get(e, f) for e in x]
 					if type(x) == tuple:
 						n = tuple(n)
 					return n
