@@ -7,15 +7,22 @@ import inspect
 import io
 import json as _json
 import keyring
+import Levenshtein
 import matplotlib.pyplot as plt
 import os
 import pickle as pkl
 import re
 import requests
+import select
+import shutil
 import subprocess
 import sys
+import threading
+import time
 import traceback
+import urllib
 
+from base64 import b64encode, b64decode
 from bs4 import BeautifulSoup as Soup
 from collections import defaultdict, namedtuple
 from contextlib import contextmanager as _cm
@@ -33,15 +40,63 @@ from rich.text import Text
 from term_image.image import from_url
 from uuid import uuid4
 
+from sel import Sel
+
+ospj = os.path.join
+
+b64_alpha = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/='
+_bytes = bytes
+def base64(s, encoding='utf-8', bytes=False):
+	if not (isinstance(s, str) or isinstance(s, _bytes)):
+		raise Exception("Need str or bytes as input")
+	
+	if isinstance(s, str):
+		b = s.encode(encoding=encoding)
+	else:
+		b = s
+		s = b.decode(encoding=encoding)
+
+	if s == '':
+		return ''
+
+	if all(c in b64_alpha for c in s):
+		# Input is base64
+		ret = b64decode(b)
+	else:
+		# Input is NOT base64
+		ret = b64encode(b)
+
+	return ret if bytes else ret.decode()
+b64 = base64
+
+def dd(factory=list):
+	return defaultdict(factory)
+
 _olddir = __builtins__['dir']
+
+_isatty = sys.stdout.isatty()
+def isatty():
+	global _isatty
+	return _isatty
 
 _oldprint = __builtins__['print']
 def oldprint(*a, **kw):
 	global _oldprint
 	return _oldprint(*a, **kw)
 
-def print(*a, **kw):
-	if not sys.stdout.isatty():
+def print(*a, synt=None, **kw):
+	if synt is not None:
+		return syntax(*a, synt=synt, **kw)
+
+	if len(a) == 1 and isinstance(a[0], str):
+		if (t:=a[0].strip()).startswith('{') and t.endswith('}'):
+			try:
+				txt = _json.dumps(_json.loads(a[0]), indent=2)
+				return richprint(txt)
+			except _json.JSONDecodeError as e:
+				pass
+
+	if not isatty():
 		return oldprint(*a, **kw)
 
 	try:
@@ -54,18 +109,29 @@ def print(*a, **kw):
 		except:
 			oldprint(*a, **kw)
 
+_ll_global_console = Console()
 def _print(*a, **kw):
+	global _ll_global_console
+
 	# from term_image.image import BaseImage
 	if any('KittyImage' in str(type(x)) for x in a):
 		return oldprint(*a, **kw)
-	if any((len(bs:=bytes(x.strip(), encoding='utf-8'))>0 and bs[0]==27) for x in a):
+	if any((len(bs:=_bytes(x.strip(), encoding='utf-8'))>0 and bs[0]==27) for x in a):
 		return oldprint(*a, **kw)
 	if len(a)==1:
 		fl = str(a[0]).strip().split('\n')[0].lower()
 		if '<!doctype' in fl or '<html' in fl:
 			return richprint(Syntax(Soup(a[0], 'html.parser').prettify(), 'html'))
 
-	richprint(*a, **kw)
+	# richprint(*a, **kw)
+	for i, e in enumerate(a):
+		if isinstance(str(e)):
+			for k, v in {
+				'green]': 'dark_sea_green3]',
+				'red]': 'light_coral]',
+			}.items():
+				a[i] = a[i].replace(k, v)
+	_ll_global_console.print(*a, **kw)
 	
 __builtins__['print'] = print # fuggit
 
@@ -90,16 +156,37 @@ alpha = 'abcdefghijklmnopqrstuvwxyz'
 alpha += alpha.upper()
 
 nums = '0123456789'
+digits = nums
+
+def sleep(*a, **kw):
+	return time.sleep(*a, **kw)
+
+def is_file(fn):
+	if not fexists(fn):
+		err(f"couldn't find [grey70]{fn}[/grey70]")
+	return os.path.isfile(fn)
+isfile = is_file
+
+def is_dir(fn):
+	if not fexists(fn):
+		err(f"couldn't find [grey70]{fn}[/grey70]")
+	return os.path.isdir(fn)
+isdir = is_dir
 
 def uuid():
 	return str(uuid4())
 
-def regf(regex):
+def regf(regex, multiline=True, all=False):
 	def _(s):
-		res = re.search(regex, s)
+		if all:
+			return re.findall(regex, s, *[re.MULTILINE]*multiline)
+		res = re.search(regex, s, *[re.MULTILINE]*multiline)
 		if res is None:
 			return None
-		return res.group(1)
+		try:
+			return res.group(1)
+		except:
+			return res.group(0)
 	return _
 
 def plot(ys, title='', xlabel='', ylabel=''):
@@ -155,9 +242,64 @@ def read(fn, strip=True, b=False):
 def bread(fn):
 	return read(fn, strip=False, b=True)
 
-def write(fn, txt, ensure_newline=True):
+def mkdir(d, exist_ok=True):
+	if not d:
+		return
+	d = fix_path(d)
+
+	os.makedirs(d, exist_ok=exist_ok)
+
+def last_line(fn):
+	# Code taken from: https://stackoverflow.com/a/54278929
+	with open(fn, 'rb') as f:
+		try:  # catch OSError in case of a one line file
+			f.seek(-2, os.SEEK_END)
+			while f.read(1) != b'\n':
+				f.seek(-2, os.SEEK_CUR)
+		except OSError:
+			f.seek(0)
+		last_line = f.readline().decode()
+
+	return last_line
+
+def append(fn, txt, ensure_pre_newline=True, ensure_post_newline=True, require_exist=False):
 	if len(fn)>100 and not len(txt)>100:
 		txt,fn=fn,txt
+	if len(lines(fn))>0 and len(lines(txt))==1:
+		txt,fn=fn,txt
+
+	if require_exist and not fexists(fn):
+		raise Exception(f'file "{fn}" gotta exist if require_exist=True')
+
+	if (dn:=os.path.dirname(fn)) and not fexists(dn):
+		mkdir(dn)
+
+	fn = fix_path(fn)
+
+	if ensure_pre_newline and (not last_line(fn).endswith('\n')) and (not txt.startswith('\n')):
+		txt = '\n' + txt
+	if ensure_post_newline and (not txt.endswith('\n')):
+		txt = txt + '\n'
+
+	mode = 'a' if require_exist else 'a+'
+	with open(fn, mode) as f:
+		f.write(txt)
+
+def touch(fn):
+	if not fexists(fn):
+		if (dn:=os.path.dirname(fn)) and dn!='.':
+			os.makedirs(os.path.dirname(fn), exist_ok=True)
+		with open(fn, 'w+') as f:
+			f.write('')
+
+def write(fn, txt, ensure_newline=True, create_dirs=True):
+	if len(fn)>100 and not len(txt)>100:
+		txt,fn=fn,txt
+	if len(lines(fn))>0 and len(lines(txt))==1:
+		txt,fn=fn,txt
+
+	if (dn:=os.path.dirname(fn)) and not fexists(dn):
+		mkdir(dn)
 
 	fn = fix_path(fn)
 
@@ -279,11 +421,37 @@ def md5(s, encoding='utf-8', b=False):
 def fmd5(s, encoding='utf-8'):
 	return hashlib.md5(bread(s)).hexdigest()
 
+def detect_single_csv_row(x):
+	if isinstance(x, dict):
+		return render_csv([x], no_headers=True)
+	if isinstance(x, list) and len(x)>0 and isinstance(x[0], dict):
+		return render_csv(x)
+	if any(isinstance(x, y) for y in (list, tuple, set, type({}.keys()))):
+		return render_csv(list(x), no_headers=True)
+
+	return None
+
 def csv_row(row):
+	if (rv:=detect_single_csv_row(row)) is not None:
+		return rv
+
 	return next(_csv.reader(io.StringIO(row)))
 
-def render_csv(row_dicts):
+def render_csv(row_dicts, no_headers=False):
 	assert(len(row_dicts) > 0)
+
+	if isinstance(row_dicts, dict):
+		row_dicts = [row_dicts]
+	if any(not isinstance(y, dict) for y in row_dicts):
+		buf = ''
+		for i, x in enumerate(row_dicts):
+			if i>0:
+				buf += ','
+			if ',' in str(x):
+				buf += f'"{x}"'
+			else:
+				buf += str(x)
+		return buf
 
 	def _render_field(x):
 		x = str(x)
@@ -293,21 +461,34 @@ def render_csv(row_dicts):
 			return x
 
 	buf = ''
-	buf += ','.join(map(_render_field, list(row_dicts[0].keys())))
-	for row in row_dicts:
-		buf += '\n'
+	if not no_headers:
+		buf += ','.join(map(_render_field, list(row_dicts[0].keys())))
+	for i, row in enumerate(row_dicts):
+		if (hasattr(row_dicts, '__len__') and len(row_dicts)>=1) and (i==0 or not no_headers):
+			buf += '\n'
 		buf += ','.join(map(_render_field, list(row.values())))
 
 	return buf
 
-def csv(fn, delim=None, header=True, convert=True, empty=''):
-	if isinstance(fn, list) and len(fn)>0 and isinstance(fn[0], dict):
-		return render_csv(fn)
+def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
+	assert(not ('dicts' in kwargs and 'header' in kwargs))
+	header = True
+	if 'dicts' in kwargs:
+		header = kwargs['dicts']
+	elif 'header' in kwargs:
+		header = kwargs['header']
+
+
+	if (rv:=detect_single_csv_row(fn)) is not None:
+		return rv
 
 	fn = fix_path(fn)
 
-	if len(fn) > 100 and not os.path.exists(fn):
+	# if len(fn) > 100 and not os.path.exists(fn):
+	if not os.path.exists(fn) and (delim or ',') in fn:
 		write(fn, fn:=f'/tmp/{uuid()}')
+		if delim is None:
+			delim = ','
 	if delim is None:
 		with open(fn, 'r') as f:
 			try:
@@ -316,37 +497,41 @@ def csv(fn, delim=None, header=True, convert=True, empty=''):
 				if 'Could not determine delimiter' in str(e):
 					delim = ','
 
-	with open(fn, 'r') as f:
-		r = _csv.reader(f, delimiter=delim)
+	if wc_l(fn) == 1: # TODO: faster wc_l in general
+		return next(_csv.reader(lines(fn), delimiter=delim))
 
-		if header:
-			cols = next(r)
-
-		rows = []
-		for row in r:
-			if convert:
-				nr = []
-				for e in row:
-					try:
-						if (m:=re.findall('^([0-9]+)$', e)) and m[0]==e:
-							nr.append(int(e))
-						else:
-							if int(e)==float(e):
-								nr.append(int(e))
-							else:
-								nr.append(float(e))
-					except ValueError:
-						nr.append(e)
-				row = nr
-			row = [(e if e!='' else empty) for e in row]
+	def _itr():
+		with open(fn, 'r') as f:
+			r = _csv.reader(f, delimiter=delim)
 
 			if header:
-				rows.append({cols[i]: row[i] for i in range(len(row))})
-			else:
-				rows.append(row)
+				cols = next(r)
+
+			rows = []
+			for row in r:
+				if convert:
+					nr = []
+					for e in row:
+						try:
+							if (m:=re.findall('^([0-9]+)$', e)) and m[0]==e:
+								nr.append(int(e))
+							else:
+								if int(e)==float(e):
+									nr.append(int(e))
+								else:
+									nr.append(float(e))
+						except ValueError:
+							nr.append(e)
+					row = nr
+				row = [(e if e!='' else empty) for e in row]
+
+				if header:
+					yield {cols[i]: row[i] for i in range(len(row))}
+				else:
+					yield row
 
 
-	return rows
+	return list(_itr()) if not stream else _itr()
 	
 
 	
@@ -413,6 +598,7 @@ def cache(f):
 
 
 def wc_l(fn, empties=True):
+	# TODO: faster
 	fn = fix_path(fn)
 
 	count = 0
@@ -433,10 +619,16 @@ def items(d):
 	return list(d.items())
 
 def yn(msg, default_yes=False):
+	global _ll_global_console
+
 	ynstr = '([dark_sea_green3]y[/dark_sea_green3]/[light_coral]N[/light_coral])'
 	if default_yes:
 		ynstr = ynstr.replace('y','Y').replace('n','N')
-	resp = Console().input(f'{msg} {ynstr}: ').strip().lower()
+	try:
+		resp = _ll_global_console.input(f'{msg} {ynstr}: ').strip().lower()
+	except KeyboardInterrupt:
+		print('')
+		quit(1)
 	if not resp:
 		return default_yes
 	return resp in ['yes', 'y']
@@ -542,14 +734,55 @@ def dbg(a):
 	print(a)
 	return a
 
-def html(url):
+def post(*a, **kw):
+	if 'method' in kw:
+		del kw['method']
+	return html(*a, method=requests.post, **kw)
+
+def html(*a, tries=1, **kw):
+	for _ in range(tries):
+		try:
+			if (resp:=_html(*a, **kw)) is None:
+				time.sleep(2)
+				continue
+			return resp
+		except:
+			time.sleep(2)
+
+def _html(url, fake_user=False, b=False, method=requests.get, **kwargs):
+	if fake_user:
+		kwargs.update({
+			'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+			'accept-language': 'en-US,en;q=0.9',
+			'cache-control': 'max-age=0',
+			'priority': 'u=0, i',
+			'sec-ch-ua': '"Not(A:Brand";v="8", "Chromium";v="144", "Google Chrome";v="144"',
+			'sec-ch-ua-mobile': '?0',
+			'sec-ch-ua-platform': '"macOS"',
+			'sec-fetch-dest': 'document',
+			'sec-fetch-mode': 'navigate',
+			'sec-fetch-site': 'none',
+			'sec-fetch-user': '?1',
+			'upgrade-insecure-requests': '1',
+			'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
+		})
+	if 'payload' in kwargs and 'json' not in kwargs:
+		kwargs['json'] = kwargs['payload']
+		del kwargs['payload']
+
 	try:
-		return requests.get(url).text
+		res = method(url, **kwargs)
+		if b:
+			return res.content
+		else:
+			return res.text
 	except requests.exceptions.MissingSchema:
 		try:
-			return requests.get('https://'+url).text
+			res = method('https://'+url, **kwargs)
+			return res.content if b else res.text
 		except:
-			return requests.get('http://'+url).text
+			res = method('http://'+url, **kwargs)
+			return res.content if b else res.text
 http = html
 webpage = html
 web = html
@@ -557,8 +790,8 @@ site = html
 page = html
 url = html
 
-def soup(url):
-	return Soup(html(url), 'html.parser')
+def soup(url, **kwargs):
+	return Soup(html(url, **kwargs), 'html.parser')
 
 
 def json(url):
@@ -606,6 +839,9 @@ def is_repl():
 def import_from(path, *syms, **aliases):
 	if len(syms)==1 and type(syms[0])==list:
 		syms = syms[0]
+	if len(syms)==1 and type(syms[0])==str and fexists(syms[0]) and not fexists(path):
+		path, syms[0] = syms[0], path
+
 	smod = import_py(path, up=1)
 	dmod = sys.modules[inspect.currentframe().f_back.f_globals['__name__']]
 	for a in _olddir(smod):
@@ -649,7 +885,7 @@ def fix_path(path):
 
 	return path
 
-def ls(path='.', abs=False, rel=False):
+def ls(path='.', abs=False, rel=False, t=True):
 	if abs and rel:
 		print('\n[grey50]ll.ls got both abs and rel; choosing abs[grey50]\n')
 
@@ -666,10 +902,13 @@ def ls(path='.', abs=False, rel=False):
 	if abs or rel:
 		files = [os.path.join(path, f) for f in files]
 
+	if t:
+		files = sorted(files, key=lambda f: os.path.getctime(os.path.join(path, f)))
+
 	return files
 
-basename = os.path.basename
-dirname = os.path.dirname
+bn = basename = os.path.basename
+dn = dirname = os.path.dirname
 
 def dot(k):
 	return lambda x: x[k] if isinstance(x, dict) else getattr(x, k)
@@ -748,14 +987,17 @@ def andify(l, quote='', oxford=True):
 			
 	return ', '.join(ss[:-1]) 
 
-def digits(s):
+def only_digits(s):
 	return ''.join(c for c in s if c in '0123456789')
 
-def track(i, total=None):
+def track(i, total=None, title=None):
+	kwargs = {}
 	if total is not None:
-		return _track(i, total=total)
-	else:
-		return _track(i)
+		kwargs['total'] = total
+	if title is not None:
+		kwargs['title'] = title
+	
+	return _track(i, total=total, description=title)
 
 
 class gen:
@@ -784,21 +1026,33 @@ def filter(f, l, stream=False):
 			if f(e):
 				yield e
 
-	return _it() if stream else list(_it())
+	if stream:
+		return _it()
+	elif isinstance(l, str):
+		return ''.join(l)
+	else:
+		for t in (tuple, set):
+			if isinstance(l, t):
+				return t(_it())
+		# Finally:
+		return list(_it())
 
 
 def first(f, l):
 	for e in filter(f, l, stream=True):
 		return e
 
-def agg(l, extractor):
-	if callable(l) and not callable(extractor):
-		l, extractor = extractor, l
+def agg(l, key=lambda x: x, val=lambda x: x):
+	# TODO: does this swap logic make sense?
+	if callable(l) and not callable(key):
+		l, key = key, l
+	if callable(l) and not callable(val):
+		l, val = val, l
 
 	dd = defaultdict(list)
 
 	for e in l:
-		dd[extractor(e)].append(e)
+		dd[key(e)].append(val(e))
 
 	return dd
 
@@ -822,6 +1076,9 @@ def env(var, loc=None, refresh_global=False, crash=False):
 	assert(loc is None or refresh_global is False)
 
 	global _ll_global_dotenv_found
+
+	if loc is not None and loc.startswith('~'):
+		loc.replace('~', os.environ['HOME'])
 
 	if loc is not None:
 		assert(fexists(loc))
@@ -853,3 +1110,278 @@ def cat(*ls):
 	for l in ls:
 		buf.extend(l)
 	return buf
+
+def error(*a, kill=True, kill_9=False, **kw):
+	print('')
+	if (pn:=os.path.basename(sys.argv[0])):
+		print(f'[bold light_coral]{pn}:[/bold light_coral] error: ', end='')
+	else:
+		print('[bold light_coral]error:[/bold light_coral] ', end='')
+	print(*a, **kw)
+	print('')
+	if kill or kill_9:
+		if kill_9:
+			os._exit(1)
+		else:
+			sys.exit(1)
+
+def err(*a, **kw):
+	return error(*a, **kw)
+
+def pwd():
+	return os.getcwd()
+
+def lzip(l):
+	return [(l[i], l[i+1]) for i in range(len(l)-1)]
+
+def has_stdin(timeout=1):
+	return bool(select.select([sys.stdin], [], [], timeout)[0])
+
+def stdin(lines=False):
+	return sys.stdin.readlines() if lines else sys.stdin.read()
+
+def swap(a, b, or_conds):
+	return (b, a) if any(or_conds) else (a, b)
+
+def _syntax(txt, synt):
+	txt, synt = swap(txt, synt, [
+		'\n' in synt and '\n' not in txt,
+		len(synt)>20 and len(txt)<=20
+	])
+	if '\n' in synt and '\n' not in txt:
+		synt, txt = txt, synt
+
+	if synt == 'json':
+		txt = _json.dumps(_json.loads(txt), indent=2)
+
+	return richprint(Syntax(txt, synt))
+
+def syntax(txt, synt):
+	try:
+		return _syntax(txt, synt)
+	except:
+		print(txt)
+
+def synt(*a, **kw):
+	return syntax(*a, **kw)
+
+def input(file=False, join_args=True, preferred_arg=1):
+	if has_stdin():
+		return stdin()
+	elif len(sys.argv) <= 1:
+		err('no input is available, either on stdin or as a filename CL arg')
+	else:
+		try:
+			fn = sys.argv[preferred_arg]
+		except:
+			fn = sys.argv[1]
+
+		if file:
+			if not fexists(fn):
+				err(f"file read specifically requested, but can't find file [grey70]{fn}[/grey70]")
+
+			return read(fn)
+
+		else:
+			if len(sys.argv) == 2 and fexists(fn:=sys.argv[1]):
+				warn(f"file reading mode isn't on, but you passed the single file [grey70]{fn}[/grey70], so we're reading it anyway")
+
+			if join_args:
+				return ' '.join(sys.argv[1:])
+			else:
+				try:
+					return sys.argv[preferred_arg]
+				except:
+					return sys.argv[1]
+
+def cl_input(*a, **kw):
+	if 'file' in kw:
+		kw['file'] = False
+	return input(*a, **kw)
+
+def cli_input(*a, **kw):
+	if 'file' in kw:
+		kw['file'] = False
+	return cl_input(*a, **kw)
+
+class sentinel:
+	pass
+
+def sent(x):
+	return isinstance(x, sentinel)
+
+
+def ass(cond, err_msg=sentinel()):
+	cond, err_msg = swap(cond, err_msg, [
+		isinstance(cond, str) and
+		not isinstance(err_msg, str) and
+		not sent(err_msg)
+	])
+
+	if not cond:
+		if not sent(err_msg):
+			err(err_msg)
+		else:
+			raise Exception('Assertion failed')
+
+
+def uniq_fn(fn):
+	cursor = fn
+	while fexists(cursor):
+		cursor = f'real_{cursor}'
+
+	return cursor
+
+
+def mv(fn1, fn2, force=False, ignore=False):
+	assert(not (force and ignore))
+	# ass(is_file(fn1), err_msg=f"[grey70]{fn1}[/grey70] is not a file")
+	if not fexists(fn1):
+		err(f"file [grey70]{fn1}[/grey70] not found")
+	if is_dir(fn1):
+		err(f"file [grey70]{fn1}[/grey70] is a directory")
+
+	if fexists(fn2) and not force:
+		if ignore:
+			return
+		err(f"need to pass [grey70]force=[/grey70][green]True[/green] to overwrite file [grey70]{fn2}[/grey70]")
+
+	return shutil.move(fn1, fn2)
+
+
+def cp(fn1, fn2, force=False):
+	ass(is_file(fn1), err_msg=f"[grey70]{fn1}[/grey70] is not a file")
+	if not force and fexists(fn2):
+		err(f"[grey70]{fn2}[/grey70] already exists; try calling with [grey70]force=True[/grey70] if you don't care")
+
+	mkdir(dirname(fn2))
+
+	return shutil.copy2(fn1, fn2)
+
+def copy(*a, **kw):
+	return cp(*a, **kw)
+
+def escape(txt):
+	return urllib.parse.quote(txt)
+
+def unescape(txt):
+	return urllib.parse.unquote(txt)
+
+def lev(s1, s2):
+	return Levenshtein.distance(s1, s2)
+
+def strip(s):
+	return s.strip()
+
+def freqs(l):
+	fs = defaultdict(int)
+	for e in l:
+		fs[e] += 1
+	return fs
+freq = freqs
+
+
+def thread(lam, *a, daemon=True, join=False, **kw):
+	t = threading.Thread(target=lam, daemon=daemon, args=a, kwargs=kw)
+	t.start()
+	if join:
+		return t.join()
+	else:
+		return None
+
+
+def makedirs(*a, **kw):
+	return os.makedirs(*a, **kw)
+
+
+@_cm
+def tmp_dir(name=None, persist=False):
+	if name is not None:
+		dst = ospj('/tmp', name)
+		if fexists(dst):
+			if isdir(dst):
+				raise Exception(f"directory {dst} already exists")
+			else:
+				# Unnecessary scolding
+				raise Exception(f"{dst} already exists, and it's a file, not even a directory")
+	else:
+		dst = ospj('/tmp', uuid())
+
+	os.makedirs(dst)
+
+	yield dst
+
+	if not persist:
+		shutil.rmtree(tmp_dir)
+tmpdir = tmp_dir
+
+
+def add_newline_if_missing(fn):
+	if not fexists(fn):
+		raise Exception(f"Target {fn} does not exist")
+	if last_line(fn)[-1] != '\n':
+		with open(fn, 'a') as f:
+			f.write('\n')
+
+
+def sel_dl(url, dst_dir=None, dst_name=None, b=False, clobber=False, ignore=False, ensure_newline=True, tries=10, wait=1):
+	# Input checks
+	if clobber and ignore:
+		raise Exception(f"You can't pass both clobber=True and ignore=True, bro")
+	if (dst_dir is not None) and (dst_name is not None):
+		_dst = ospj(dst_dir, dst_name)
+		if b:
+			raise Exception(f"You asked for download destination {_dst}, but you also passed b=True, which means you want the file in-memory in bytes. So which is it?")
+		if fexists(_dst):
+			if not clobber:
+				if ignore:
+					return
+				else:
+					raise Exception(f"Destination name {_dst} already exists" + ' (and is a directory, for that matter)'*isdir(dst) + "; pass clobber=True if you're OK with that, or ignore=True to do nothing instead")
+			elif clobber and isdir(_dst):
+				raise Exception(f"Destination name {_dst} already exists as a directory")
+	elif (dst_dir is not None) and b:
+		raise Exception(f"You asked for download destination directory {dst}, but you also passed b=True, which means you want the file in-memory in bytes. So which is it?")
+	elif (dst_name is not None) and b:
+		raise Exception(f"You asked for download destination name {dst}, but you also passed b=True, which means you want the file in-memory in bytes. So which is it?")
+
+	# Function to do the actual downloading
+	# (we may or may not call it in a context manager, so it's separated out)
+	def _dl(dst_dir, dst_name=None):
+		with Sel.tmp(headless=True, linger=False, download_dir=dst_dir) as sel:
+			before = ls(dst_dir)
+			sel.load_new_window(url) # to prevent hanging
+
+			for _ in range(tries):
+				while len(after:=ls(dst_dir)) == len(before):
+					sleep(wait)
+			if len(after) <= len(before):
+				raise Exception(f"Couldn't download {url}")
+
+			fn = ospj(dst_dir, after[-1])
+
+			if dst_name is not None:
+				# This could theoretically just be force=True, since, if the file
+				# exists, we're only here if clobber=True, but I think it's better
+				# to be redundant because I'm not very smart
+				mv(fn, (nfn:=ospj(dst_dir, dst_name)), force=clobber)
+				fn = nfn
+
+			return fn
+
+	# Download the file
+	if dst_dir is None:
+		with tmpdir() as dst_dir:
+			fn = _dl(dst_dir, dst_name)
+	else:
+		fn = _dl(dst_dir, dst_name)
+
+	if ensure_newline:
+		add_newline_if_missing(fn)
+
+	if dst_name is None:
+		# Return the downloaded file in memory & delete the file
+		return read(fn, b=b)
+	else:
+		# Return the downloaded file's path
+		return fn
