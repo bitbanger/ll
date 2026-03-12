@@ -1,4 +1,6 @@
 import __main__
+import argparse
+import atexit
 import csv as _csv
 import getpass
 import hashlib
@@ -10,8 +12,10 @@ import keyring
 import Levenshtein
 import matplotlib.pyplot as plt
 import os
+import pathlib
 import pickle as pkl
 import re
+import readline
 import requests
 import select
 import shutil
@@ -25,8 +29,9 @@ import urllib
 from base64 import b64encode, b64decode
 from bs4 import BeautifulSoup as Soup
 from collections import defaultdict, namedtuple
-from contextlib import contextmanager as _cm
+from contextlib import contextmanager as _cm, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
+from datetime import timedelta as td
 from dotenv import find_dotenv, load_dotenv
 from functools import wraps
 from rich import print as richprint
@@ -39,8 +44,6 @@ from rich.syntax import Syntax
 from rich.text import Text
 from term_image.image import from_url
 from uuid import uuid4
-
-from sel import Sel
 
 ospj = os.path.join
 
@@ -84,6 +87,9 @@ def oldprint(*a, **kw):
 	global _oldprint
 	return _oldprint(*a, **kw)
 
+def is_image_fn(fn):
+	return fn.split('.')[-1].lower() in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp')
+
 def print(*a, synt=None, **kw):
 	if synt is not None:
 		return syntax(*a, synt=synt, **kw)
@@ -95,6 +101,14 @@ def print(*a, synt=None, **kw):
 				return richprint(txt)
 			except _json.JSONDecodeError as e:
 				pass
+		elif t.startswith('http') and is_image_fn(a[0]):
+			ext = a[0].split('.')[-1]
+			write(http(t, b=True), f'/tmp/img.{ext}')
+			print(run(f'kitty icat /tmp/img.{ext}'))
+			return
+		elif '/' in a[0] and fexists(a[0]) and is_image_fn(a[0]):
+			print(run(f'kitty icat {a[0]}'))
+			return
 
 	if not isatty():
 		return oldprint(*a, **kw)
@@ -102,6 +116,7 @@ def print(*a, synt=None, **kw):
 	try:
 		_print(*a, **kw)
 	except Exception as e:
+		_oldprint(e)
 		if isinstance(e, KeyboardInterrupt):
 			raise e
 		try:
@@ -116,7 +131,7 @@ def _print(*a, **kw):
 	# from term_image.image import BaseImage
 	if any('KittyImage' in str(type(x)) for x in a):
 		return oldprint(*a, **kw)
-	if any((len(bs:=_bytes(x.strip(), encoding='utf-8'))>0 and bs[0]==27) for x in a):
+	if any((len(bs:=_bytes(str(x).strip(), encoding='utf-8'))>0 and bs[0]==27) for x in a):
 		return oldprint(*a, **kw)
 	if len(a)==1:
 		fl = str(a[0]).strip().split('\n')[0].lower()
@@ -125,12 +140,14 @@ def _print(*a, **kw):
 
 	# richprint(*a, **kw)
 	for i, e in enumerate(a):
-		if isinstance(str(e)):
+		if isinstance(e, str):
+			_a = list(a)
 			for k, v in {
 				'green]': 'dark_sea_green3]',
 				'red]': 'light_coral]',
 			}.items():
-				a[i] = a[i].replace(k, v)
+				_a[i] = _a[i].replace(k, v)
+			a = tuple(_a)
 	_ll_global_console.print(*a, **kw)
 	
 __builtins__['print'] = print # fuggit
@@ -189,6 +206,28 @@ def regf(regex, multiline=True, all=False):
 			return res.group(0)
 	return _
 
+def splitf(regex):
+	def _(s):
+		chunks = []
+		buf = ''
+		while s:
+			match = regf(regex)(s)
+			if match and s.index(match)==0:
+				if buf:
+					chunks.append(buf)
+					buf = ''
+				chunks.append(match)
+				s = s[len(match):]
+			else:
+				buf += s[0]
+				s = s[1:]
+		if buf:
+			chunks.append(buf)
+			buf = ''
+
+		return chunks
+	return _
+
 def plot(ys, title='', xlabel='', ylabel=''):
 	plt.plot(range(len(ys)), ys)
 	if xlabel:
@@ -228,7 +267,20 @@ def dedupe(l):
 	return r
 
 def rule(title=None, pre_space=1, post_space=1):
-	a = ['']*pre_space + [Rule(title=title, style='grey30')] + ['']*post_space
+	pre = []
+	for i in range(pre_space):
+		if i > 0:
+			pre.append('\n')
+		else:
+			pre.append('')
+	post = []
+	for i in range(post_space):
+		if i > 0:
+			post.append('\n')
+		else:
+			post.append('')
+
+	a = pre + [Rule(title=title, style='grey30')] + post
 	richprint(*a)
 
 def read(fn, strip=True, b=False):
@@ -249,6 +301,11 @@ def mkdir(d, exist_ok=True):
 
 	os.makedirs(d, exist_ok=exist_ok)
 
+
+def first_line(fn):
+	return next(stream_lines(fn))
+
+
 def last_line(fn):
 	# Code taken from: https://stackoverflow.com/a/54278929
 	with open(fn, 'rb') as f:
@@ -262,10 +319,15 @@ def last_line(fn):
 
 	return last_line
 
+
 def append(fn, txt, ensure_pre_newline=True, ensure_post_newline=True, require_exist=False):
-	if len(fn)>100 and not len(txt)>100:
+	if fexists(txt) and not fexists(fn):
 		txt,fn=fn,txt
-	if len(lines(fn))>0 and len(lines(txt))==1:
+	elif fexists(fn) and not fexists(txt):
+		pass
+	elif len(fn)>100 and not len(txt)>100:
+		txt,fn=fn,txt
+	elif len(lines(fn))>1 and len(lines(txt))==1:
 		txt,fn=fn,txt
 
 	if require_exist and not fexists(fn):
@@ -292,20 +354,39 @@ def touch(fn):
 		with open(fn, 'w+') as f:
 			f.write('')
 
-def write(fn, txt, ensure_newline=True, create_dirs=True):
-	if len(fn)>100 and not len(txt)>100:
-		txt,fn=fn,txt
-	if len(lines(fn))>0 and len(lines(txt))==1:
-		txt,fn=fn,txt
+def write(fn, txt, ensure_newline=True, create_dirs=True, swap=True):
+	if swap:
+		if isinstance(txt, dict):
+			txt = _json.dumps(txt, indent=2)
+		if isinstance(fn, dict):
+			fn = _json.dumps(fn, indent=2)
+			txt,fn=fn,txt
+		if isinstance(txt, list) and all(isinstance(x, dict) for x in txt):
+			txt = _json.dumps(txt, indent=2)
+		if isinstance(fn, list) and all(isinstance(x, dict) for x in fn):
+			fn = _json.dumps(fn, indent=2)
+
+		if len(fn)>100 and not len(txt)>100:
+			txt,fn=fn,txt
+		elif '/' in txt and '/' in fn and fexists(abs(dirname(txt))) and (not fexists(abs(dirname(fn)))):
+			fn,txt=txt,fn
+		elif (not fexists(fn)) and (len(lines(fn))>1 and len(lines(txt))==1):
+			txt,fn=fn,txt
+		elif '/' in txt and '/' in fn and fexists(dirname(txt)) and not fexists(dirname(fn)):
+			txt,fn=fn,txt
+	
 
 	if (dn:=os.path.dirname(fn)) and not fexists(dn):
 		mkdir(dn)
 
 	fn = fix_path(fn)
 
-	if ensure_newline and (len(txt) == 0 or txt[-1] != '\n'):
+	if ensure_newline and isinstance(txt, str) and (len(txt) == 0 or txt[-1] != '\n'):
 		txt += '\n'
-	with open(fn, 'w+') as f:
+	mode = 'w+'
+	if isinstance(txt, bytes):
+		mode = 'wb+'
+	with open(fn, mode) as f:
 		f.write(txt)
 
 def split(s, delim='', empties=True):
@@ -346,6 +427,15 @@ def tail(x, n, invert=False):
 	else:
 		return '\n'.join(x[:-n])
 
+def nhead(x, n):
+	def _it():
+		with open(x, 'r') as f:
+			for i, l in enumerate(f.readlines()):
+				if i < n:
+					continue
+				yield l
+
+	return ''.join(list(_it())).strip()
 
 def lines(s, intuit_file=True, stream=False, strip=True):
 	if type(s) != str:
@@ -356,8 +446,8 @@ def lines(s, intuit_file=True, stream=False, strip=True):
 			if (not strip) or (line:=line.strip()):
 				yield line
 
-	if intuit_file and os.path.exists(s):
-		with open(s, 'r') as f:
+	if intuit_file and os.path.exists(fix_path(s)):
+		with open(fix_path(s), 'r') as f:
 			it = _itr(f.readlines())
 	else:
 		it = _itr((s.strip() if strip else s).split('\n'))
@@ -415,13 +505,18 @@ def nth(n):
 	return _nth
 
 def md5(s, encoding='utf-8', b=False):
-	h = hashlib.md5(s.encode(encoding)).hexdigest()
+	content = s.encode(encoding) if not fexists(fix_path(s)) else bread(s)
+	h = hashlib.md5(content).hexdigest()
 	return int(h, 16) if b else h
 
 def fmd5(s, encoding='utf-8'):
 	return hashlib.md5(bread(s)).hexdigest()
 
 def detect_single_csv_row(x):
+	if isinstance(x, type({}.keys())):
+		return detect_single_csv_row(list(x))
+	if isinstance(x, type({}.values())):
+		return detect_single_csv_row(list(x))
 	if isinstance(x, dict):
 		return render_csv([x], no_headers=True)
 	if isinstance(x, list) and len(x)>0 and isinstance(x[0], dict):
@@ -435,7 +530,10 @@ def csv_row(row):
 	if (rv:=detect_single_csv_row(row)) is not None:
 		return rv
 
-	return next(_csv.reader(io.StringIO(row)))
+	if len(lines(row.strip())) == 1:
+		return next(_csv.reader([row.strip()]))
+	else:
+		return next(_csv.reader(io.StringIO(row)))
 
 def render_csv(row_dicts, no_headers=False):
 	assert(len(row_dicts) > 0)
@@ -454,6 +552,9 @@ def render_csv(row_dicts, no_headers=False):
 		return buf
 
 	def _render_field(x):
+		if isinstance(x, datetime):
+			return x.strftime('%Y-%m-%d %H:%M:%S')
+
 		x = str(x)
 		if ',' in x:
 			return '"' + x.replace('"', '""') + '"'
@@ -471,6 +572,16 @@ def render_csv(row_dicts, no_headers=False):
 	return buf
 
 def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
+	if isinstance(fn, str) and (len(lines(fn))==1) and (len(fn.split(','))>1) and (not fexists(fn)):
+		return csv_row(fn)
+
+	if isinstance(fn, list) and len(fn) > 0 and all(isinstance(e, dict) for e in fn):
+		keys = sorted(list(fn[0].keys()))
+		for row in fn[1:]:
+			if sorted(list(row.keys())) != keys:
+				raise Exception(f"rows of input have different sets of keys")
+		return render_csv(fn)
+
 	assert(not ('dicts' in kwargs and 'header' in kwargs))
 	header = True
 	if 'dicts' in kwargs:
@@ -497,8 +608,9 @@ def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
 				if 'Could not determine delimiter' in str(e):
 					delim = ','
 
-	if wc_l(fn) == 1: # TODO: faster wc_l in general
-		return next(_csv.reader(lines(fn), delimiter=delim))
+	# I can't remember why I even added this...
+	# if wc_l(fn) == 1: # TODO: faster wc_l in general
+		# return next(_csv.reader(lines(fn), delimiter=delim))
 
 	def _itr():
 		with open(fn, 'r') as f:
@@ -512,6 +624,12 @@ def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
 				if convert:
 					nr = []
 					for e in row:
+						try:
+							nr.append(datetime.strptime(e, '%Y-%m-%d %H:%M:%S'))
+							break
+						except ValueError:
+							pass
+
 						try:
 							if (m:=re.findall('^([0-9]+)$', e)) and m[0]==e:
 								nr.append(int(e))
@@ -567,34 +685,37 @@ def cache_key(f, args, kwargs):
 
 
 here_cache_cache = dict()
-def cache(f):
-	@wraps(f)
-	def wrapper(*args, cache_base=None, **kwargs):
-		global here_cache_cache
-		if cache_base is None:
-			if f.__qualname__ not in here_cache_cache:
-				here_cache_cache[f.__qualname__] = here(up=1) # this was 2 at one point & didn't work in repl or file. now it's 1 & works in both. but just be aware ig
-			cache_base = here_cache_cache[f.__qualname__]
-		for a in [*args]+list(kwargs.values()):
-			if ' object at ' in str(a):
-				print(f"Warning: can't hash argument \"{str(a)}\" to cache <{str(f)}> call")
-				return f(*args, **kwargs)
+def cache(stale=None, cache_base=None):
+	def inner_cache(f, stale=None, cache_base=None):
+		@wraps(f)
+		def wrapper(*args, stale=None, cache_base=None, **kwargs):
+			global here_cache_cache
+			if cache_base is None:
+				if f.__qualname__ not in here_cache_cache:
+					here_cache_cache[f.__qualname__] = here(up=1) # this was 2 at one point & didn't work in repl or file. now it's 1 & works in both. but just be aware ig
+				cache_base = here_cache_cache[f.__qualname__]
+			for a in [*args]+list(kwargs.values()):
+				if ' object at ' in str(a):
+					print(f"Warning: can't hash argument \"{str(a)}\" to cache <{str(f)}> call")
+					return f(*args, **kwargs)
 
-		key = cache_key(f, args, kwargs)
-		path = os.path.join(cache_base, f'cache/{key}')
-		if os.path.exists(path):
-			return unpickle(path)
-		else:
-			cdir = os.path.join(cache_base, 'cache')
+			key = cache_key(f, args, kwargs)
+			path = os.path.join(cache_base, f'cache/{key}')
 
-			# Actually calculate the result
-			res = f(*args, **kwargs)
+			if os.path.exists(path) and ((stale is None) or (age(path)<stale)):
+				return unpickle(path)
+			else:
+				cdir = os.path.join(cache_base, 'cache')
 
-			os.makedirs(cdir, exist_ok=True)
-			pickle(path, res)
-			return res
+				# Actually calculate the result
+				res = f(*args, **kwargs)
 
-	return wrapper
+				os.makedirs(cdir, exist_ok=True)
+				pickle(path, res)
+				return res
+
+		return lambda: wrapper(stale=stale, cache_base=cache_base)
+	return lambda _f: inner_cache(_f, stale=stale, cache_base=cache_base)
 
 
 def wc_l(fn, empties=True):
@@ -607,6 +728,10 @@ def wc_l(fn, empties=True):
 			if (not empties) or l.strip():
 				count += 1
 	return count
+
+
+def wc_c(fn):
+	return os.stat(fix_path(fn)).st_size
 
 
 def keys(d):
@@ -751,7 +876,7 @@ def html(*a, tries=1, **kw):
 
 def _html(url, fake_user=False, b=False, method=requests.get, **kwargs):
 	if fake_user:
-		kwargs.update({
+		kwargs.update({'headers': {
 			'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
 			'accept-language': 'en-US,en;q=0.9',
 			'cache-control': 'max-age=0',
@@ -765,7 +890,7 @@ def _html(url, fake_user=False, b=False, method=requests.get, **kwargs):
 			'sec-fetch-user': '?1',
 			'upgrade-insecure-requests': '1',
 			'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36',
-		})
+		}})
 	if 'payload' in kwargs and 'json' not in kwargs:
 		kwargs['json'] = kwargs['payload']
 		del kwargs['payload']
@@ -791,6 +916,8 @@ page = html
 url = html
 
 def soup(url, **kwargs):
+	if url.strip().endswith('</html>'):
+		return Soup(url, 'html.parser')
 	return Soup(html(url, **kwargs), 'html.parser')
 
 
@@ -798,7 +925,7 @@ def json(url):
 	if isinstance(url, dict):
 		return _json.dumps(url)
 	else:
-		if (url:=url.strip()).startswith('{'):
+		if (url:=url.strip()).startswith('{') or url.startswith('['):
 			txt = url
 		elif os.path.exists(url):
 			txt = read(url)
@@ -812,6 +939,8 @@ def json(url):
 
 
 def here(p='', up=0, abs=True):
+	if p.startswith('/'):
+		return p
 	assert(up>=0)
 	h = os.path.dirname(inspect.stack()[1+up].filename)
 	res = os.path.join(h, p) if p else h
@@ -837,6 +966,8 @@ def is_repl():
 	return main_file() is None
 
 def import_from(path, *syms, **aliases):
+	path = fix_path(path)
+
 	if len(syms)==1 and type(syms[0])==list:
 		syms = syms[0]
 	if len(syms)==1 and type(syms[0])==str and fexists(syms[0]) and not fexists(path):
@@ -885,7 +1016,7 @@ def fix_path(path):
 
 	return path
 
-def ls(path='.', abs=False, rel=False, t=True):
+def ls(path='.', abs=False, rel=False, t=True, pat=None):
 	if abs and rel:
 		print('\n[grey50]ll.ls got both abs and rel; choosing abs[grey50]\n')
 
@@ -902,21 +1033,65 @@ def ls(path='.', abs=False, rel=False, t=True):
 	if abs or rel:
 		files = [os.path.join(path, f) for f in files]
 
+	if pat is not None:
+		files = [f for f in files if regf(pat)(f)]
+
 	if t:
 		files = sorted(files, key=lambda f: os.path.getctime(os.path.join(path, f)))
 
 	return files
 
+
 bn = basename = os.path.basename
 dn = dirname = os.path.dirname
 
+
+def crawl(p='.', stream=False, filt=None, abs=False):
+	def _ok(x):
+		return (filt is None) or (re.search(filt, x))
+
+	if isfile(p):
+		if _ok(p):
+			def _sit():
+				if abs:
+					yield os.path.abspath(p)
+				else:
+					yield rempre(p, os.path.abspath(os.getcwd()) + '/')
+			return _sit() if stream else list(_sit())
+		else:
+			raise Exception(f"You passed a single file ('{p}'), but it didn't match the filter ('{filt}')")
+
+	def _it():
+		for fn in ls(p, abs=True):
+			if isdir(fn):
+				for e in crawl(p=fn):
+					if _ok(e):
+						yield e
+			else:
+				if _ok(fn):
+					yield fn
+	def _it2():
+		for e in _it():
+			if abs:
+				yield p
+			else:
+				yield rempre(e, os.path.abspath(os.getcwd()) + '/')
+
+	return _it2() if stream else list(_it2())
+
+
 def dot(k):
 	return lambda x: x[k] if isinstance(x, dict) else getattr(x, k)
+
+def dotcall(k):
+	return lambda x: x[k]() if isinstance(x, dict) else getattr(x, k)()
 
 def dot_eq(k, v):
 	return lambda x: v == (x[k] if isinstance(x, dict) else getattr(x, k))
 
 def fexists(p):
+	if (not isinstance(p, str)) and (not isinstance(p, pathlib.Path)):
+		return False
 	if p.startswith('~'):
 		p = p.replace('~', os.environ['HOME'], 1)
 	return os.path.exists(p)
@@ -970,7 +1145,7 @@ def secure_get(k, svc='ll', prompt=True):
 def andify(l, quote='', oxford=True):
 	l = list(l)
 
-	ss = [f'{quote}{e}{quote}"' for e in l]
+	ss = [f'{quote}{e}{quote}' for e in l]
 
 	match len(ss):
 		case 0:
@@ -990,14 +1165,18 @@ def andify(l, quote='', oxford=True):
 def only_digits(s):
 	return ''.join(c for c in s if c in '0123456789')
 
-def track(i, total=None, title=None):
+def track(i, total=None, title=None, console=None):
+	global _ll_global_console
+	if console is None:
+		console = _ll_global_console
+
 	kwargs = {}
 	if total is not None:
 		kwargs['total'] = total
 	if title is not None:
 		kwargs['title'] = title
 	
-	return _track(i, total=total, description=title)
+	return _track(i, total=total, description=title, console=console)
 
 
 class gen:
@@ -1038,8 +1217,8 @@ def filter(f, l, stream=False):
 		return list(_it())
 
 
-def first(f, l):
-	for e in filter(f, l, stream=True):
+def first(l, cond=bool):
+	for e in filter(cond, l, stream=True):
 		return e
 
 def agg(l, key=lambda x: x, val=lambda x: x):
@@ -1056,19 +1235,58 @@ def agg(l, key=lambda x: x, val=lambda x: x):
 
 	return dd
 
+def now():
+	return datetime.now()
+
+def days(n=1):
+	return timedelta(days=n)
+day = days
+
+def hours(n):
+	return timedelta(hours=n)
+hour = hours
+
+def minutes(n):
+	return timedelta(minutes=n)
+minute = minutes
+
+def seconds(n):
+	return timedelta(seconds=n)
+second = seconds
+
+def ctime(fn):
+	return datetime.fromtimestamp(os.stat(fix_path(fn)).st_ctime)
 
 def mtime(fn):
-	return datetime.utcfromtimestamp(os.stat(fix_path(fn)).st_mtime)
+	return datetime.fromtimestamp(os.stat(fix_path(fn)).st_mtime)
 
+def touched(fn):
+	return max(mtime(fn), ctime(fn))
+
+def age(fn):
+	return now()-touched(fn)
 
 def dt(x):
 	if isinstance(x, int) or isinstance(x, float):
 		return dt(datetime.utcfromtimestamp(x))
 
-	if isinstance(x, str):
-		return datetime.strptime(x, '%Y-%m-%d')
-	else:
-		return x.strftime('%Y-%m-%d')
+	for fstr in (
+		'%Y-%m-%d %H:%M:%S',
+		'%Y/%m/%d %H:%M:%S',
+		'%Y-%m-%d %H:%M',
+		'%Y/%m/%d %H:%M',
+		'%Y-%m-%d',
+		'%Y/%m/%d',
+	):
+		try:
+			if isinstance(x, str):
+				return datetime.strptime(x, fstr)
+			else:
+				return x.strftime(fstr)
+		except ValueError:
+			continue
+
+	raise ValueError(f"No fstrs we know about can parse '{x}'")
 
 
 _ll_global_dotenv_found = False
@@ -1127,6 +1345,11 @@ def error(*a, kill=True, kill_9=False, **kw):
 
 def err(*a, **kw):
 	return error(*a, **kw)
+
+def warn(*a, **kw):
+	print(f'[bold orange3]warning:[/bold orange3] ', end='')
+	print(*a, **kw)
+	print('')
 
 def pwd():
 	return os.getcwd()
@@ -1206,6 +1429,8 @@ def cli_input(*a, **kw):
 
 class sentinel:
 	pass
+class Sentinel:
+	pass
 
 def sent(x):
 	return isinstance(x, sentinel)
@@ -1249,10 +1474,13 @@ def mv(fn1, fn2, force=False, ignore=False):
 	return shutil.move(fn1, fn2)
 
 
-def cp(fn1, fn2, force=False):
+def cp(fn1, fn2, force=False, exist_ok=False):
 	ass(is_file(fn1), err_msg=f"[grey70]{fn1}[/grey70] is not a file")
-	if not force and fexists(fn2):
-		err(f"[grey70]{fn2}[/grey70] already exists; try calling with [grey70]force=True[/grey70] if you don't care")
+	if fexists(fn2):
+		if not (force or exist_ok):
+			err(f"[grey70]{fn2}[/grey70] already exists; try calling with [grey70]force=True[/grey70] or [grey70]exist_ok=True[/grey70] if you don't care")
+		elif exist_ok:
+			return
 
 	mkdir(dirname(fn2))
 
@@ -1263,9 +1491,11 @@ def copy(*a, **kw):
 
 def escape(txt):
 	return urllib.parse.quote(txt)
+quote = escape
 
 def unescape(txt):
 	return urllib.parse.unquote(txt)
+unquote = unescape
 
 def lev(s1, s2):
 	return Levenshtein.distance(s1, s2)
@@ -1324,7 +1554,12 @@ def add_newline_if_missing(fn):
 			f.write('\n')
 
 
-def sel_dl(url, dst_dir=None, dst_name=None, b=False, clobber=False, ignore=False, ensure_newline=True, tries=10, wait=1):
+def sel(url):
+	with Sel.tmp(url, headless=True, linger=False) as sel:
+		return sel.src()
+
+
+def sel_dl(url, dst_dir=None, dst_name=None, b=False, clobber=False, ignore=False, ensure_newline=True, tries=10, wait=1, headless=True, cookies=None):
 	# Input checks
 	if clobber and ignore:
 		raise Exception(f"You can't pass both clobber=True and ignore=True, bro")
@@ -1348,7 +1583,7 @@ def sel_dl(url, dst_dir=None, dst_name=None, b=False, clobber=False, ignore=Fals
 	# Function to do the actual downloading
 	# (we may or may not call it in a context manager, so it's separated out)
 	def _dl(dst_dir, dst_name=None):
-		with Sel.tmp(headless=True, linger=False, download_dir=dst_dir) as sel:
+		with Sel.tmp(headless=headless, linger=False, download_dir=dst_dir, cookies=cookies) as sel:
 			before = ls(dst_dir)
 			sel.load_new_window(url) # to prevent hanging
 
@@ -1385,3 +1620,496 @@ def sel_dl(url, dst_dir=None, dst_name=None, b=False, clobber=False, ignore=Fals
 	else:
 		# Return the downloaded file's path
 		return fn
+
+
+@_cm
+def silent(out=True, err=True):
+	with open(os.devnull, 'w') as f:
+		with redirect_stderr(f):
+			yield
+
+silence = silent
+
+
+# from selenium import webdriver
+with silent():
+	from seleniumwire import webdriver
+from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.support.ui import Select
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+class Sel:
+	def __init__(self, url=None, headless=False, linger=False, download_dir=None, cookies=None):
+		self.headless = headless
+		self.last_loaded_url = None
+
+		if download_dir is None:
+			download_dir = os.path.join(os.environ['HOME'], 'Downloads')
+
+		self.options = Options()
+		self.options.set_preference('permissions.default.stylesheet', 2)
+		self.options.set_preference('permissions.default.image', 2)
+		self.options.set_preference('browser.download.folderList', 2)
+		self.options.set_preference('browser.download.manager.showWhenStarting', False)
+		self.options.set_preference('browser.download.dir', os.path.abspath(download_dir))
+		self.options.set_preference('devtools.jsonview.enabled', False)
+		self.options.set_preference('browser.helperApps.neverAsk.saveToDisk', 'text/csv')
+		if self.headless:
+			self.options.add_argument("--headless")
+
+		self.driver = webdriver.Firefox(options=self.options)
+
+		self.cookies = Sel.parse_cookies(cookies, dictate=False)
+		if self.cookies is not None:
+			# for k, v in self.cookies.items():
+				# self.driver.add_cookie({
+					# 'name': k,
+					# 'value': v,
+				# })
+
+			def interceptor(request):
+				request.headers['Cookie'] = self.cookies
+			self.driver.request_interceptor = interceptor
+
+		self._closed = False
+		if not linger:
+			atexit.register(self.close)
+
+		if url is not None:
+			self.load(url)
+
+
+	@staticmethod
+	def parse_cookies(cookies, dictate=True):
+
+		if isinstance(cookies, str):
+			if fexists(cookies):
+				cookies = read(cookies)
+			if not dictate:
+				return cookies
+
+			d = {}
+			cstrs = map(strip, cookies.split(';'))
+			for cs in cstrs:
+				spl = cs.split('=')
+				d[spl[0]] = '='.join(spl[1:])
+
+			return d
+
+		elif isinstance(cookies, dict):
+			return cookies
+		else:
+			return None
+
+
+	@staticmethod
+	@_cm
+	def tmp(*a, **kw):
+		try:
+			sel = Sel(*a, **kw)
+			yield sel
+		finally:
+			if 'linger' not in kw or not kw['linger']:
+				sel.close()
+
+
+	def load(self, url):
+		self.driver.get(url)
+		self.last_loaded_url = url
+
+
+	def load_new_window(self, url):
+		self.driver.execute_script(f'window.open("{url}","_blank");')
+
+
+	def xpath(self, tag='*', **kw):
+		for k in ('txt', 'text', 'content'):
+			if k in kw:
+				kw['contains'] = kw[k]
+				del kw[k]
+		contains = kw.get('contains')
+		if 'contains' in kw:
+			del kw['contains']
+
+		attrs = [f'[@{k}="{v}"]' for k, v in kw.items()]
+		if contains is not None:
+			attrs.append(f'[contains(text(), "{contains}")]')
+
+		return f'//{tag}' + ''.join(attrs)
+
+
+	def el(self, wait=10, **kw):
+		return WebDriverWait(self.driver, wait).until(
+			EC.presence_of_element_located((By.XPATH, self.xpath(**kw))))
+
+
+	def els(self, *a, poll=1, wait=10, min_num=1, strict=True, **kw):
+		found = []
+
+		waited = 0
+		while True:
+			# If we're done or have waited too long
+			if (len(found) >= min_num) or waited >= wait:
+				break
+			# Wait & account for the polling time
+			WebDriverWait(self.driver, poll).until(
+				EC.presence_of_element_located((By.XPATH, self.xpath(**kw))))
+			waited += poll
+			# Add all found elements
+			for e in self.driver.find_elements(By.XPATH, self.xpath(**kw)):
+				found.append(e)
+
+		if strict and (len(found) < min_num):
+			raise Exception(f"You asked for a minimum of {min_num} elements, and strict=True, and we only found {len(found)}")
+
+		return found
+
+
+	def click(self, **kw):
+		self.el(**kw).click()
+
+
+	def click_at(self, **kw):
+		ActionChains(self.driver).move_to_element_with_offset(self.el(**kw), 5, 5).click().perform()
+
+
+	def type(self, txt, **kw):
+		self.el(**kw).send_keys(txt)
+
+
+	def type_at(self, txt, **kw):
+		ActionChains(self.driver).move_to_element(self.el(**kw)).click().send_keys(txt).perform()
+
+
+	def select(self, txt, **kw):
+		Select(self.el(**kw)).select_by_visible_text(txt)
+
+
+	def screenshot(self, name='page.png'):
+		self.driver.save_screenshot(name)
+
+
+	def src(self):
+		return self.driver.page_source
+
+
+	def source(self):
+		return self.src()
+
+
+	def close(self):
+		if self._closed:
+			return
+		self.driver.quit()
+		self._closed = True
+
+
+def norm(s, ok=alpha+nums+'_'):
+	cmap = {c: c for c in ok}
+	cmap.update({c.upper(): c for c in ok if c.upper() not in cmap})
+	cmap.update({c.lower(): c for c in ok if c.lower() not in cmap})
+
+	if ' ' not in ok:
+		cmap.update({' ': '_'})
+
+	if '-' not in ok:
+		cmap.update({'-': '_'})
+	elif '_' not in ok:
+		cmap.update({'_': '-'})
+
+	buf = ''
+	for c in s:
+		if c in cmap:
+			buf += cmap[c]
+	return buf
+
+
+'''
+class Arg:
+	def __init__(self, name, type=None, default=Sentinel, required=None, optional=None):
+		dash = name.startswith('-')
+		name = norm(name, ok=alpha+nums+'-')
+
+		# Make sure these are consistent (I sometimes forget which to use)
+		if (optional is not None) and (required is not None):
+			if optional == required:
+				raise Exception(f"You passed optional={optional} and required={required}!")
+		elif required is None:
+			required = not optional
+		elif optional is None:
+			optional = not required
+		elif (required is None) and (optional is None):
+			required, optional = False, True
+			if default != Sentinel:
+				default = None
+
+		# Sanity check
+		if required and (default != Sentinel):
+			raise Exception(f"How can '{name}' be required if you also gave a default value?")
+
+		# Infer type from default
+		_type = __builtins__['type']
+		if (type is None) and (default != Sentinel):
+			type = _type(default)
+'''
+
+
+
+
+
+
+
+
+
+def arg(*a, **kw):
+	ap = argparse.ArgumentParser()
+	ap.add_argument(*a, **kw)
+	args, _ = ap.parse_known_args()
+
+	short, long = None, None
+	if a[0].startswith('-'):
+		if a[0].startswith('--'):
+			long = a[0]
+		else:
+			short = a[0]
+	if len(a) > 1 and a[1].startswith('-'):
+		if a[1].startswith('--'):
+			long = a[1]
+		else:
+			short = a[1]
+
+	arg = (long or short) or a[0]
+	while arg[0] == '-':
+		arg = arg[1:]
+
+	return getattr(args, arg.lower().strip().replace('-', '_'))
+
+
+def words(s):
+	return [w.strip().lower() for w in s.strip().split()]
+
+
+def words_in(a, b):
+	if not (isinstance(a, str) and isinstance(b, str)):
+		return False
+
+	wsa, wsb = words(a), words(b)
+	return len([wa for wa in wsa if wa in wsb])
+
+
+def camelCase(s):
+	if '_' not in s:
+		return s
+	chunks = s.split('_')
+	return chunks[0].lower() + ''.join([c[0].upper()+c[1:].lower() for c in chunks[1:]])
+camel = camelCase
+
+def UpperCamel(s):
+	if len(s) == '':
+		return ''
+
+	uc = camelCase(s)
+	return uc[0].upper() + uc[1:]
+upper_camel = UpperCamel
+uppercamel = UpperCamel
+
+def uncamel(s):
+	chunks = []
+	buf = ''
+	for i, c in enumerate(s):
+		if i==0:
+			buf += c
+			continue
+		if c==c.upper():
+			chunks.append(buf)
+			buf = c
+		else:
+			buf += c
+	if buf:
+		chunks.append(buf)
+		buf = ''
+
+	return '_'.join([c.lower() for c in chunks])
+
+
+def equal(a, b):
+	return a == b
+equals = equal
+
+
+def rich(txt):
+	return ((c:=Console(record=True, file=io.StringIO())).print(txt, end=''), c.export_text(styles=True))[-1]
+
+
+def options(
+	a,
+	msg='Please choose one: ',
+	msg_col='bold orange3',
+	col1='gold3',
+	col2='plum3',
+	padding=1,
+	idx=False,
+):
+	for _ in range(padding):
+		print('')
+	print(f"[{msg_col}]{msg}[/{msg_col}]")
+	id2opt = {}
+	for i, opt in enumerate(a):
+		col = col1 if i%2 else col2
+		print(f"\t[grey70]\[[/grey70]{i+1}[grey70]][/grey70] [{col}]{opt}[/{col}]")
+
+	res = None
+	while True:
+		x = __builtins__['input'](rich('\n[grey70]Choice: [/grey70]'))
+		if x.isnumeric() and (int(x) in range(1, len(a)+1)):
+			res = a[int(x)-1]
+			break
+
+	for _ in range(padding):
+		print('')
+
+	return (int(x)-1) if idx else res
+
+
+def no_nones(l):
+	return [e for e in l if e is not None]
+nonones = no_nones
+
+def rempre(s, pre):
+	if pre.startswith(s):
+		s,pre=pre,s
+	if s.startswith(pre):
+		return s[len(pre):]
+	return s
+
+def remsuf(s, suf):
+	if suf.endswith(s):
+		s,suf=suf,s
+	if s.endswith(suf):
+		return s[:-len(suf)]
+	return s
+
+
+class lldd:
+	def __init__(self, factory=list):
+		self.factory = factory
+		self.children = dict()
+		# self.v = Sentinel
+		self._val = Sentinel
+
+
+	@property
+	def val(self):
+		if self._val == Sentinel:
+			self._val = self.factory()
+		return self._val
+
+	@val.setter
+	def val(self, v):
+		self._val = v
+
+
+	def __getattr__(self, attr):
+		try:
+			return self.__getattribute__(attr)
+		except AttributeError:
+			return self.val.__getattribute__(attr)
+
+
+	def __iadd__(self, val):
+		self._val = self.val + val
+		return self._val
+
+
+	def __getitem__(self, idx):
+		if idx not in self.children:
+			self.children[idx] = lldd(factory=self.factory)
+		return self.children[idx]
+
+
+	def __setitem__(self, idx, val):
+		if idx not in self.children:
+			self.children[idx] = lldd(factory=self.factory)
+		self.children[idx].val = val
+
+
+	# def __getattr__(self, attr):
+		# return getattr(self.val, attr)
+
+
+	# def __setattr__(self, attr, val):
+		# self.__setattribute__(attr, val)
+		# return setattr(self.val, attr, val)
+
+
+	def __len__(self):
+		return len(self.children)
+
+
+	def keys(self):
+		return list(self.children.keys())
+
+
+	def vals(self):
+		return list(self.children.vals())
+
+
+	def items(self):
+		return list(self.children.items())
+
+
+	def __iter__(self):
+		return self.items()
+
+
+	def get(self, idx):
+		return self.children.get(idx)
+
+
+	def dict(self):
+		caller = inspect.stack()[1]
+		if len(self.children) > 0:
+			_d = {}
+			for k, v in self.children.items():
+				_d[k] = v.dict()
+			return _d
+		else:
+			recursion = (caller.filename == __file__ and caller.function == 'dict')
+			return self.val if recursion else {}
+
+
+# Errata:
+# 	1. In reality, Patricia does not trie very hard
+def patricia(trie, prefcomb=lambda a,b:f'{a} {b}' if a else b, _pref=''):
+	if isinstance(trie, lldd):
+		trie = trie.dict()
+
+	if (not isinstance(trie, dict)) or len(trie)==0:
+		return trie
+
+	elif len(trie) == 1:
+		tk = list(trie.keys())[0]
+		# _pref = prefcomb(_pref, tk)
+		return patricia(trie[tk], _pref=prefcomb(_pref,tk), prefcomb=prefcomb)
+		# return {prefcomb(_pref, k): patricia(v, _pref=prefcomb(_pref, k), prefcomb=prefcomb)
+			# for k, v in trie.items()}
+
+	return {prefcomb(_pref,k): patricia(v, _pref=prefcomb(_pref,k), prefcomb=prefcomb) for k, v in trie.items()}
+
+
+
+def trie(seqs=None):
+	if seqs is None:
+		seqs = []
+
+	seqs = [list(x) for x in seqs]
+	d = lldd(int)
+
+	for seq in seqs:
+		cursor = d
+		for e in seq:
+			cursor = cursor[e]
+
+	return d
