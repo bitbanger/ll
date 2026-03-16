@@ -573,14 +573,14 @@ def render_csv(row_dicts, no_headers=False, delim=','):
 
 def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
 	if isinstance(fn, str) and (len(lines(fn))==1) and (len(fn.split(delim))>1) and (not fexists(fn)):
-		return csv_row(fn, delim=delim)
+		return csv_row(fn, delim=delim or ',')
 
 	if isinstance(fn, list) and len(fn) > 0 and all(isinstance(e, dict) for e in fn):
 		keys = sorted(list(fn[0].keys()))
 		for row in fn[1:]:
 			if sorted(list(row.keys())) != keys:
 				raise Exception(f"rows of input have different sets of keys")
-		return render_csv(fn, delim=delim)
+		return render_csv(fn, delim=delim or ',')
 
 	assert(not ('dicts' in kwargs and 'header' in kwargs))
 	header = True
@@ -590,7 +590,7 @@ def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
 		header = kwargs['header']
 
 
-	if (rv:=detect_single_csv_row(fn, delim=delim)) is not None:
+	if (rv:=detect_single_csv_row(fn, delim=delim or ',')) is not None:
 		return rv
 
 	fn = fix_path(fn)
