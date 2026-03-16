@@ -512,30 +512,30 @@ def md5(s, encoding='utf-8', b=False):
 def fmd5(s, encoding='utf-8'):
 	return hashlib.md5(bread(s)).hexdigest()
 
-def detect_single_csv_row(x):
+def detect_single_csv_row(x, delim=','):
 	if isinstance(x, type({}.keys())):
 		return detect_single_csv_row(list(x))
 	if isinstance(x, type({}.values())):
 		return detect_single_csv_row(list(x))
 	if isinstance(x, dict):
-		return render_csv([x], no_headers=True)
+		return render_csv([x], no_headers=True, delim=delim)
 	if isinstance(x, list) and len(x)>0 and isinstance(x[0], dict):
-		return render_csv(x)
+		return render_csv(x, delim=delim)
 	if any(isinstance(x, y) for y in (list, tuple, set, type({}.keys()))):
-		return render_csv(list(x), no_headers=True)
+		return render_csv(list(x), no_headers=True, delim=delim)
 
 	return None
 
-def csv_row(row):
-	if (rv:=detect_single_csv_row(row)) is not None:
+def csv_row(row, delim=','):
+	if (rv:=detect_single_csv_row(row, delim=delim)) is not None:
 		return rv
 
 	if len(lines(row.strip())) == 1:
-		return next(_csv.reader([row.strip()]))
+		return next(_csv.reader([row.strip()], delimiter=delim))
 	else:
-		return next(_csv.reader(io.StringIO(row)))
+		return next(_csv.reader(io.StringIO(row), delimiter=delim))
 
-def render_csv(row_dicts, no_headers=False):
+def render_csv(row_dicts, no_headers=False, delim=','):
 	assert(len(row_dicts) > 0)
 
 	if isinstance(row_dicts, dict):
@@ -544,8 +544,8 @@ def render_csv(row_dicts, no_headers=False):
 		buf = ''
 		for i, x in enumerate(row_dicts):
 			if i>0:
-				buf += ','
-			if ',' in str(x):
+				buf += delim
+			if delim in str(x):
 				buf += f'"{x}"'
 			else:
 				buf += str(x)
@@ -556,31 +556,31 @@ def render_csv(row_dicts, no_headers=False):
 			return x.strftime('%Y-%m-%d %H:%M:%S')
 
 		x = str(x)
-		if ',' in x:
+		if delim in x:
 			return '"' + x.replace('"', '""') + '"'
 		else:
 			return x
 
 	buf = ''
 	if not no_headers:
-		buf += ','.join(map(_render_field, list(row_dicts[0].keys())))
+		buf += delim.join(map(_render_field, list(row_dicts[0].keys())))
 	for i, row in enumerate(row_dicts):
 		if (hasattr(row_dicts, '__len__') and len(row_dicts)>=1) and (i==0 or not no_headers):
 			buf += '\n'
-		buf += ','.join(map(_render_field, list(row.values())))
+		buf += delim.join(map(_render_field, list(row.values())))
 
 	return buf
 
 def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
-	if isinstance(fn, str) and (len(lines(fn))==1) and (len(fn.split(','))>1) and (not fexists(fn)):
-		return csv_row(fn)
+	if isinstance(fn, str) and (len(lines(fn))==1) and (len(fn.split(delim))>1) and (not fexists(fn)):
+		return csv_row(fn, delim=delim)
 
 	if isinstance(fn, list) and len(fn) > 0 and all(isinstance(e, dict) for e in fn):
 		keys = sorted(list(fn[0].keys()))
 		for row in fn[1:]:
 			if sorted(list(row.keys())) != keys:
 				raise Exception(f"rows of input have different sets of keys")
-		return render_csv(fn)
+		return render_csv(fn, delim=delim)
 
 	assert(not ('dicts' in kwargs and 'header' in kwargs))
 	header = True
@@ -590,7 +590,7 @@ def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
 		header = kwargs['header']
 
 
-	if (rv:=detect_single_csv_row(fn)) is not None:
+	if (rv:=detect_single_csv_row(fn, delim=delim)) is not None:
 		return rv
 
 	fn = fix_path(fn)
@@ -626,7 +626,7 @@ def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
 					for e in row:
 						try:
 							nr.append(datetime.strptime(e, '%Y-%m-%d %H:%M:%S'))
-							break
+							continue
 						except ValueError:
 							pass
 
@@ -692,7 +692,7 @@ def cache(stale=None, cache_base=None):
 			global here_cache_cache
 			if cache_base is None:
 				if f.__qualname__ not in here_cache_cache:
-					here_cache_cache[f.__qualname__] = here(up=1) # this was 2 at one point & didn't work in repl or file. now it's 1 & works in both. but just be aware ig
+					here_cache_cache[f.__qualname__] = here(up=2) 
 				cache_base = here_cache_cache[f.__qualname__]
 			for a in [*args]+list(kwargs.values()):
 				if ' object at ' in str(a):
@@ -702,7 +702,7 @@ def cache(stale=None, cache_base=None):
 			key = cache_key(f, args, kwargs)
 			path = os.path.join(cache_base, f'cache/{key}')
 
-			if os.path.exists(path) and ((stale is None) or (age(path)<stale)):
+			if os.path.exists(os.path.abspath(path)) and ((stale is None) or (age(path)<stale)):
 				return unpickle(path)
 			else:
 				cdir = os.path.join(cache_base, 'cache')
@@ -714,7 +714,7 @@ def cache(stale=None, cache_base=None):
 				pickle(path, res)
 				return res
 
-		return lambda: wrapper(stale=stale, cache_base=cache_base)
+		return lambda *a,**kw: wrapper(*a, stale=stale, cache_base=cache_base, **kw)
 	return lambda _f: inner_cache(_f, stale=stale, cache_base=cache_base)
 
 
@@ -2113,3 +2113,9 @@ def trie(seqs=None):
 			cursor = cursor[e]
 
 	return d
+
+
+def replaces(s, repls):
+	for k, v in repls.items():
+		s = s.replace(k, v)
+	return s
