@@ -90,7 +90,12 @@ def oldprint(*a, **kw):
 def is_image_fn(fn):
 	return fn.split('.')[-1].lower() in ('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp')
 
-def print(*a, synt=None, **kw):
+def err_print(*a, **kw):
+	if 'stderr' in kw:
+		del kw['stderr']
+	return print(*a, stderr=True, **kw)
+
+def print(*a, synt=None, stderr=False, **kw):
 	if synt is not None:
 		return syntax(*a, synt=synt, **kw)
 
@@ -125,8 +130,11 @@ def print(*a, synt=None, **kw):
 			oldprint(*a, **kw)
 
 _ll_global_console = Console()
-def _print(*a, **kw):
+_ll_global_error_console = Console(stderr=True)
+def _print(*a, stderr=False, **kw):
 	global _ll_global_console
+	global _ll_global_error_console
+	console = _ll_global_console if not stderr else _ll_global_error_console
 
 	# from term_image.image import BaseImage
 	if any('KittyImage' in str(type(x)) for x in a):
@@ -136,19 +144,24 @@ def _print(*a, **kw):
 	if len(a)==1:
 		fl = str(a[0]).strip().split('\n')[0].lower()
 		if '<!doctype' in fl or '<html' in fl:
-			return richprint(Syntax(Soup(a[0], 'html.parser').prettify(), 'html'))
+			# return richprint(Syntax(Soup(a[0], 'html.parser').prettify(), 'html'))
+			return console.print(Syntax(Soup(a[0], 'html.parser').prettify(), 'html'))
 
 	# richprint(*a, **kw)
 	for i, e in enumerate(a):
 		if isinstance(e, str):
 			_a = list(a)
 			for k, v in {
-				'green]': 'dark_sea_green3]',
-				'red]': 'light_coral]',
+				' green]': ' dark_sea_green3]',
+				' red]': ' light_coral]',
+				'[green ': '[dark_sea_green3 ',
+				'[red ': '[light_coral ',
+				'[green]': '[dark_sea_green3]',
+				'[red]': '[light_coral]',
 			}.items():
 				_a[i] = _a[i].replace(k, v)
 			a = tuple(_a)
-	_ll_global_console.print(*a, **kw)
+	console.print(*a, **kw)
 	
 __builtins__['print'] = print # fuggit
 
@@ -179,12 +192,14 @@ def sleep(*a, **kw):
 	return time.sleep(*a, **kw)
 
 def is_file(fn):
+	fn = fix_path(fn)
 	if not fexists(fn):
 		err(f"couldn't find [grey70]{fn}[/grey70]")
 	return os.path.isfile(fn)
 isfile = is_file
 
 def is_dir(fn):
+	fn = fix_path(fn)
 	if not fexists(fn):
 		err(f"couldn't find [grey70]{fn}[/grey70]")
 	return os.path.isdir(fn)
@@ -996,7 +1011,17 @@ def count(l):
 def counts(l):
 	return count(l)
 
-def run(cmd, stderr=False):
+def run(cmd, from_dir=None, stderr=False, strip=False):
+	from_dir = fix_path(from_dir)
+
+	if from_dir is not None:
+		if not fexists(from_dir):
+			raise Exception(f"{from_dir} doesn't exist")
+		elif not isdir(from_dir):
+			raise Exception(f"{from_dir} isn't a directory")
+		else:
+			cmd = f'cd {os.path.abspath(from_dir)} && {cmd}'
+
 	out, err = subprocess.Popen(
 		['bash', '-c', cmd],
 		stdout=subprocess.PIPE,
@@ -1004,24 +1029,49 @@ def run(cmd, stderr=False):
 	).communicate()
 
 	out, err = out.decode(), err.decode()
+	if strip:
+		out = out.strip()
+		err = err.strip()
 
 	return (out, err) if stderr else out
+
+def bash(cmd, from_dir=None, crash=False, stderr=False, strip=True):
+	out, err = run(cmd, from_dir=from_dir, stderr=True, strip=strip) # [sic]
+	if (not out) and err:
+		raise Exception(f"bash command '{cmd}' had no output w/ error text: {err}")
+	elif err and crash:
+		raise Exception(f"bash command '{cmd}' had error output: {err}")
+	return (out, err) if stderr else out
+def bashcrash(*a, **kw):
+	if 'crash' in kw:
+		del kw['crash']
+	return bash(*a, crash=True, **kw)
 
 def abs(path):
 	return os.path.abspath(str(path))
 
 def fix_path(path):
+	if path is None:
+		return None
+
 	if path.startswith('~'):
 		path = path.replace('~', os.environ.get('HOME'), 1)
 
 	return path
 
-def ls(path='.', abs=False, rel=False, t=True, pat=None):
+def ls(path='.', abs=None, rel=None, t=True, pat=None):
 	if abs and rel:
 		print('\n[grey50]ll.ls got both abs and rel; choosing abs[grey50]\n')
 
 	if path.startswith('~'):
 		path = path.replace('~', os.environ.get('HOME'), 1)
+
+	if path.startswith('/'):
+		if abs is None:
+			abs = True
+	elif '/' in path:
+		if rel is None:
+			rel = True
 
 	if abs:
 		path = os.path.abspath(path)
@@ -1037,7 +1087,7 @@ def ls(path='.', abs=False, rel=False, t=True, pat=None):
 		files = [f for f in files if regf(pat)(f)]
 
 	if t:
-		files = sorted(files, key=lambda f: os.path.getctime(os.path.join(path, f)))
+		files = sorted(files, key=lambda f: os.path.getctime(os.path.join(path, f) if not (abs or rel) else f))
 
 	return files
 
@@ -1238,20 +1288,26 @@ def agg(l, key=lambda x: x, val=lambda x: x):
 def now():
 	return datetime.now()
 
+def safe_timedelta(*a, **kw):
+	if len(a)==1 and isinstance(a[0], timedelta):
+		return a[0]
+	else:
+		return timedelta(*a, **kw)
+
 def days(n=1):
-	return timedelta(days=n)
+	return safe_timedelta(days=n)
 day = days
 
 def hours(n):
-	return timedelta(hours=n)
+	return safe_timedelta(hours=n)
 hour = hours
 
 def minutes(n):
-	return timedelta(minutes=n)
+	return safe_timedelta(minutes=n)
 minute = minutes
 
 def seconds(n):
-	return timedelta(seconds=n)
+	return safe_timedelta(seconds=n)
 second = seconds
 
 def ctime(fn):
@@ -1330,13 +1386,13 @@ def cat(*ls):
 	return buf
 
 def error(*a, kill=True, kill_9=False, **kw):
-	print('')
+	err_print('')
 	if (pn:=os.path.basename(sys.argv[0])):
-		print(f'[bold light_coral]{pn}:[/bold light_coral] error: ', end='')
+		err_print(f'[bold light_coral]{pn}:[/bold light_coral] error: ', end='')
 	else:
-		print('[bold light_coral]error:[/bold light_coral] ', end='')
-	print(*a, **kw)
-	print('')
+		err_print('[bold light_coral]error:[/bold light_coral] ', end='')
+	err_print(*a, **kw)
+	err_print('')
 	if kill or kill_9:
 		if kill_9:
 			os._exit(1)
@@ -1460,6 +1516,9 @@ def uniq_fn(fn):
 
 def mv(fn1, fn2, force=False, ignore=False):
 	assert(not (force and ignore))
+	fn1 = fix_path(fn1)
+	fn2 = fix_path(fn2)
+
 	# ass(is_file(fn1), err_msg=f"[grey70]{fn1}[/grey70] is not a file")
 	if not fexists(fn1):
 		err(f"file [grey70]{fn1}[/grey70] not found")
@@ -1475,6 +1534,9 @@ def mv(fn1, fn2, force=False, ignore=False):
 
 
 def cp(fn1, fn2, force=False, exist_ok=False):
+	fn1 = fix_path(fn1)
+	fn2 = fix_path(fn2)
+
 	ass(is_file(fn1), err_msg=f"[grey70]{fn1}[/grey70] is not a file")
 	if fexists(fn2):
 		if not (force or exist_ok):
@@ -1542,7 +1604,7 @@ def tmp_dir(name=None, persist=False):
 	yield dst
 
 	if not persist:
-		shutil.rmtree(tmp_dir)
+		shutil.rmtree(dst)
 tmpdir = tmp_dir
 
 
@@ -1559,7 +1621,22 @@ def sel(url):
 		return sel.src()
 
 
-def sel_dl(url, dst_dir=None, dst_name=None, b=False, clobber=False, ignore=False, ensure_newline=True, tries=10, wait=1, headless=True, cookies=None):
+def sel_dl(
+	url,
+	dst_dir=None,
+	dst_name=None,
+	b=False,
+	clobber=False,
+	ignore=False,
+	ensure_newline=True,
+	tries=10,
+	wait=1,
+	max_wait=30,
+	backoff_after=None,
+	headless=True,
+	cookies=None,
+	headers=None,
+):
 	# Input checks
 	if clobber and ignore:
 		raise Exception(f"You can't pass both clobber=True and ignore=True, bro")
@@ -1583,13 +1660,20 @@ def sel_dl(url, dst_dir=None, dst_name=None, b=False, clobber=False, ignore=Fals
 	# Function to do the actual downloading
 	# (we may or may not call it in a context manager, so it's separated out)
 	def _dl(dst_dir, dst_name=None):
-		with Sel.tmp(headless=headless, linger=False, download_dir=dst_dir, cookies=cookies) as sel:
+		with Sel.tmp(headless=headless, linger=False, download_dir=dst_dir, cookies=cookies, headers=headers) as sel:
 			before = ls(dst_dir)
 			sel.load_new_window(url) # to prevent hanging
 
+			wait_secs = wait
+			pre_backoff_ticks = 0
 			for _ in range(tries):
-				while len(after:=ls(dst_dir)) == len(before):
-					sleep(wait)
+				if len(after:=ls(dst_dir)) > len(before):
+					break
+				sleep(wait_secs)
+				pre_backoff_ticks += 1
+				if backoff_after is not None:
+					if pre_backoff_ticks >= backoff_after:
+						wait_secs = min(max_wait, wait_secs*2)
 			if len(after) <= len(before):
 				raise Exception(f"Couldn't download {url}")
 
@@ -1604,22 +1688,26 @@ def sel_dl(url, dst_dir=None, dst_name=None, b=False, clobber=False, ignore=Fals
 
 			return fn
 
+	def _handle_dl(fn):
+		if ensure_newline:
+			add_newline_if_missing(fn)
+		if dst_name is None:
+			# Return the downloaded file in memory & delete the file
+			return read(fn, b=b)
+		else:
+			# Return the downloaded file's path
+			return fn
+
 	# Download the file
 	if dst_dir is None:
 		with tmpdir() as dst_dir:
 			fn = _dl(dst_dir, dst_name)
+			return _handle_dl(fn)
 	else:
 		fn = _dl(dst_dir, dst_name)
+		return _handle_dl(fn)
 
-	if ensure_newline:
-		add_newline_if_missing(fn)
 
-	if dst_name is None:
-		# Return the downloaded file in memory & delete the file
-		return read(fn, b=b)
-	else:
-		# Return the downloaded file's path
-		return fn
 
 
 @_cm
@@ -1641,7 +1729,7 @@ from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 class Sel:
-	def __init__(self, url=None, headless=False, linger=False, download_dir=None, cookies=None):
+	def __init__(self, url=None, headless=False, linger=False, download_dir=None, cookies=None, headers=None):
 		self.headless = headless
 		self.last_loaded_url = None
 
@@ -1661,17 +1749,33 @@ class Sel:
 
 		self.driver = webdriver.Firefox(options=self.options)
 
-		self.cookies = Sel.parse_cookies(cookies, dictate=False)
-		if self.cookies is not None:
-			# for k, v in self.cookies.items():
-				# self.driver.add_cookie({
-					# 'name': k,
-					# 'value': v,
-				# })
 
+
+		self.interceptor = None
+		self.headers = headers
+		self.cookies = Sel.parse_cookies(cookies, dictate=False)
+
+		if self.headers is not None:
+			def interceptor(request):
+				for k, v in self.headers.items():
+					request.headers[k] = v
+			if self.interceptor is None:
+				self.interceptor = interceptor
+			else:
+				self.interceptor = lambda *a,**kw: interceptor(self.interceptor(*a,**kw))
+
+		if self.cookies is not None:
 			def interceptor(request):
 				request.headers['Cookie'] = self.cookies
-			self.driver.request_interceptor = interceptor
+			if self.interceptor is None:
+				self.interceptor = interceptor
+			else:
+				self.interceptor = lambda *a,**kw: interceptor(self.interceptor(*a,**kw))
+
+		if self.interceptor is not None:
+			self.driver.request_interceptor = self.interceptor
+
+
 
 		self._closed = False
 		if not linger:
@@ -2119,3 +2223,13 @@ def replaces(s, repls):
 	for k, v in repls.items():
 		s = s.replace(k, v)
 	return s
+
+
+def safe_int(s, none=False):
+	try:
+		return int(s)
+	except:
+		return s if not none else None
+
+def capitalize(s):
+	return s[0].upper() + s[1:].lower()
