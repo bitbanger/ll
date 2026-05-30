@@ -7,23 +7,26 @@ import hashlib
 import importlib
 import inspect
 import io
-import json as _json
+import pyjson5 as _json
 import keyring
 import Levenshtein
 import matplotlib.pyplot as plt
 import os
 import pathlib
 import pickle as pkl
+import random
 import re
 import readline
 import requests
 import select
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-import traceback
+import traceback as _traceback
+import undetected_chromedriver as uc
 import urllib
 
 from base64 import b64encode, b64decode
@@ -34,18 +37,30 @@ from datetime import datetime, timedelta
 from datetime import timedelta as td
 from dotenv import find_dotenv, load_dotenv
 from functools import wraps
+from matplotlib import colors as mcolors
 from rich import print as richprint
 from rich.console import Console
 from rich.layout import Layout
 from rich.panel import Panel
-from rich.progress import track as _track
+from rich.progress import Progress, track as _track
 from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
 from term_image.image import from_url
 from uuid import uuid4
 
-ospj = os.path.join
+from rich.color import ANSI_COLOR_NAMES
+from rich._palettes import EIGHT_BIT_PALETTE
+from rich.terminal_theme import DEFAULT_TERMINAL_THEME
+
+
+# ospj = os.path.join
+def ospj(*a, **kw):
+	a = list(a)
+	for i, e in enumerate(a):
+		if not isinstance(e, str):
+			a[i] = str(e)
+	return os.path.join(*a,**kw)
 
 b64_alpha = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/='
 _bytes = bytes
@@ -109,10 +124,10 @@ def print(*a, synt=None, stderr=False, **kw):
 		elif t.startswith('http') and is_image_fn(a[0]):
 			ext = a[0].split('.')[-1]
 			write(http(t, b=True), f'/tmp/img.{ext}')
-			print(run(f'kitty icat /tmp/img.{ext}'))
+			print(run(f'kitty icat /tmp/img.{ext}').strip())
 			return
 		elif '/' in a[0] and fexists(a[0]) and is_image_fn(a[0]):
-			print(run(f'kitty icat {a[0]}'))
+			print(run(f'kitty icat {a[0]}').strip())
 			return
 
 	if not isatty():
@@ -121,7 +136,7 @@ def print(*a, synt=None, stderr=False, **kw):
 	try:
 		_print(*a, **kw)
 	except Exception as e:
-		_oldprint(e)
+		# _oldprint(e)
 		if isinstance(e, KeyboardInterrupt):
 			raise e
 		try:
@@ -135,6 +150,14 @@ def _print(*a, stderr=False, **kw):
 	global _ll_global_console
 	global _ll_global_error_console
 	console = _ll_global_console if not stderr else _ll_global_error_console
+
+	dkt = type({}.keys())
+	dvt = type({}.values())
+	dit = type({}.items())
+	for i, e in enumerate(a):
+		if any(isinstance(e, t) for t in (dkt, dvt, dit)):
+			a = list(a)
+			a[i] = list(e)
 
 	# from term_image.image import BaseImage
 	if any('KittyImage' in str(type(x)) for x in a):
@@ -157,7 +180,9 @@ def _print(*a, stderr=False, **kw):
 				'[green ': '[dark_sea_green3 ',
 				'[red ': '[light_coral ',
 				'[green]': '[dark_sea_green3]',
+				'[/green]': '[/dark_sea_green3]',
 				'[red]': '[light_coral]',
+				'[/red]': '[/light_coral]',
 			}.items():
 				_a[i] = _a[i].replace(k, v)
 			a = tuple(_a)
@@ -184,6 +209,8 @@ def cprint(rgb, *args, **kwargs):
 
 alpha = 'abcdefghijklmnopqrstuvwxyz'
 alpha += alpha.upper()
+alpha_lower = 'abcdefghijklmnopqrstuvwxyz'
+alpha_upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
 nums = '0123456789'
 digits = nums
@@ -205,10 +232,13 @@ def is_dir(fn):
 	return os.path.isdir(fn)
 isdir = is_dir
 
-def uuid():
-	return str(uuid4())
+def uuid(dash=True):
+	u = str(uuid4())
+	if not dash:
+		u = u.replace('-', '')
+	return u
 
-def regf(regex, multiline=True, all=False):
+def regf(regex, multiline=True, all=True):
 	def _(s):
 		if all:
 			return re.findall(regex, s, *[re.MULTILINE]*multiline)
@@ -226,7 +256,7 @@ def splitf(regex):
 		chunks = []
 		buf = ''
 		while s:
-			match = regf(regex)(s)
+			match = regf(regex, all=False)(s)
 			if match and s.index(match)==0:
 				if buf:
 					chunks.append(buf)
@@ -267,16 +297,16 @@ def flatten(ls):
 			f.append(e)
 	return f
 
-def dedupe_itr(l):
+def dedupe_itr(l, key=lambda x:x):
 	seen = set()
 	for e in l:
-		if e in seen:
+		if key(e) in seen:
 			continue
-		seen.add(e)
+		seen.add(key(e))
 		yield e
 
-def dedupe(l):
-	r = dedupe_itr(l)
+def dedupe(l, key=lambda x:x):
+	r = dedupe_itr(l, key=key)
 	if type(l) == list:
 		r = list(r)
 	return r
@@ -462,8 +492,14 @@ def lines(s, intuit_file=True, stream=False, strip=True):
 				yield line
 
 	if intuit_file and os.path.exists(fix_path(s)):
-		with open(fix_path(s), 'r') as f:
-			it = _itr(f.readlines())
+		def _it():
+			with open(fix_path(s), 'r') as f:
+				while True:
+					try:
+						yield next(f)
+					except StopIteration:
+						break
+		it = _itr(_it())
 	else:
 		it = _itr((s.strip() if strip else s).split('\n'))
 
@@ -523,6 +559,10 @@ def md5(s, encoding='utf-8', b=False):
 	content = s.encode(encoding) if not fexists(fix_path(s)) else bread(s)
 	h = hashlib.md5(content).hexdigest()
 	return int(h, 16) if b else h
+
+def md5_int(s, encoding='utf-8'):
+	return md5(s, encoding=encoding, b=True)
+int_md5 = md5_int
 
 def fmd5(s, encoding='utf-8'):
 	return hashlib.md5(bread(s)).hexdigest()
@@ -646,6 +686,8 @@ def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
 							pass
 
 						try:
+							nr.append(int(e))
+							'''
 							if (m:=re.findall('^([0-9]+)$', e)) and m[0]==e:
 								nr.append(int(e))
 							else:
@@ -653,8 +695,12 @@ def csv(fn, delim=None, convert=True, empty='', stream=False, **kwargs):
 									nr.append(int(e))
 								else:
 									nr.append(float(e))
+							'''
 						except ValueError:
-							nr.append(e)
+							try:
+								nr.append(float(e))
+							except ValueError:
+								nr.append(e)
 					row = nr
 				row = [(e if e!='' else empty) for e in row]
 
@@ -692,11 +738,13 @@ def unpickle(fn):
 
 
 def cache_key(f, args, kwargs):
-	return f.__qualname__ + md5(' '.join([
+	cache_str = ' '.join([
 		str('.'.join([f.__module__, f.__qualname__])),
 		' '.join([str(a) for a in args]),
 		' '.join([f'{k}={v}' for k, v in kwargs.items()]),
-	]))
+	])
+
+	return f.__qualname__ + md5(cache_str)
 
 
 here_cache_cache = dict()
@@ -710,7 +758,7 @@ def cache(stale=None, cache_base=None):
 					here_cache_cache[f.__qualname__] = here(up=2) 
 				cache_base = here_cache_cache[f.__qualname__]
 			for a in [*args]+list(kwargs.values()):
-				if ' object at ' in str(a):
+				if (' object at ' in str(a)) and (not '__hash__' in a.__class__.__dict__):
 					print(f"Warning: can't hash argument \"{str(a)}\" to cache <{str(f)}> call")
 					return f(*args, **kwargs)
 
@@ -734,14 +782,20 @@ def cache(stale=None, cache_base=None):
 
 
 def wc_l(fn, empties=True):
+	return int(run(f'cat {fn} | wc -l').strip())
+
 	# TODO: faster
 	fn = fix_path(fn)
 
 	count = 0
 	with open(fn, 'r') as f:
-		for l in f.readlines():
-			if (not empties) or l.strip():
-				count += 1
+		try:
+			for l in f.readlines():
+				if (not empties) or l.strip():
+					count += 1
+		except UnicodeDecodeError:
+			print(fn)
+			return None
 	return count
 
 
@@ -883,14 +937,17 @@ def html(*a, tries=1, **kw):
 	for _ in range(tries):
 		try:
 			if (resp:=_html(*a, **kw)) is None:
-				time.sleep(2)
 				continue
 			return resp
-		except:
+		except Exception as e:
 			time.sleep(2)
 
-def _html(url, fake_user=False, b=False, method=requests.get, **kwargs):
-	if fake_user:
+def _html(url, cookies={}, user_agent=None, fake_user=False, b=False, method=requests.get, **kwargs):
+	if user_agent is not None:
+		kwargs.update({'headers': {
+			'User-Agent': user_agent,
+		}})
+	elif fake_user:
 		kwargs.update({'headers': {
 			'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
 			'accept-language': 'en-US,en;q=0.9',
@@ -910,18 +967,32 @@ def _html(url, fake_user=False, b=False, method=requests.get, **kwargs):
 		kwargs['json'] = kwargs['payload']
 		del kwargs['payload']
 
+	def _method(*a, **kw):
+		if not cookies:
+			# __builtins__['input'](str(a))
+			# __builtins__['input'](str(kw))
+			resp = method(*a, **kw)
+			# _oldprint(resp, resp.text)
+			return resp
+		else:
+			with requests.Session() as s:
+				s.cookies.update(cookies)
+				print(s.cookies)
+				quit()
+				return method(*a, **kw)
+
 	try:
-		res = method(url, **kwargs)
+		res = _method(url, **kwargs)
 		if b:
 			return res.content
 		else:
 			return res.text
 	except requests.exceptions.MissingSchema:
 		try:
-			res = method('https://'+url, **kwargs)
+			res = _method('https://'+url, **kwargs)
 			return res.content if b else res.text
 		except:
-			res = method('http://'+url, **kwargs)
+			res = _method('http://'+url, **kwargs)
 			return res.content if b else res.text
 http = html
 webpage = html
@@ -936,9 +1007,13 @@ def soup(url, **kwargs):
 	return Soup(html(url, **kwargs), 'html.parser')
 
 
+def sjson(txt):
+	return _json.loads(txt)
+
+
 def json(url):
-	if isinstance(url, dict):
-		return _json.dumps(url)
+	if isinstance(url, dict) or isinstance(url, list):
+		return _json.dumps(url, indent=2)
 	else:
 		if (url:=url.strip()).startswith('{') or url.startswith('['):
 			txt = url
@@ -946,7 +1021,7 @@ def json(url):
 			txt = read(url)
 		else:
 			try:
-				txt = html(url)
+				txt = lget(url)
 			except requests.exceptions.ConnectionError:
 				raise Exception(f"idk how to interpret '{url}' as a JSON file, sorry")
 
@@ -1011,29 +1086,51 @@ def count(l):
 def counts(l):
 	return count(l)
 
-def run(cmd, from_dir=None, stderr=False, strip=False):
-	from_dir = fix_path(from_dir)
+def run(cmd, live=False, out=True, err=False, code=False, dir=None):
+	dir = fix_path(dir)
 
-	if from_dir is not None:
-		if not fexists(from_dir):
-			raise Exception(f"{from_dir} doesn't exist")
-		elif not isdir(from_dir):
-			raise Exception(f"{from_dir} isn't a directory")
+	if live:
+		out = False
+		err = False
+
+	if dir is not None:
+		if not fexists(dir):
+			raise Exception(f"{dir} doesn't exist")
+		elif not isdir(dir):
+			raise Exception(f"{dir} isn't a directory")
 		else:
-			cmd = f'cd {os.path.abspath(from_dir)} && {cmd}'
+			cmd = f'cd {os.path.abspath(dir)} && {cmd}'
 
-	out, err = subprocess.Popen(
+	kw = {}
+	if not live:
+		kw['stdout'] = subprocess.PIPE
+		kw['stderr'] = subprocess.PIPE
+	p = subprocess.Popen(
 		['bash', '-c', cmd],
-		stdout=subprocess.PIPE,
-		stderr=subprocess.PIPE,
-	).communicate()
+		**kw
+	)
 
-	out, err = out.decode(), err.decode()
-	if strip:
-		out = out.strip()
-		err = err.strip()
+	_out, _err = p.communicate()
+	if not live:
+		_out, _err = _out.decode(), _err.decode()
+	_code = p.returncode
+	if live:
+		return _code
 
-	return (out, err) if stderr else out
+
+	ret = []
+	if out:
+		ret += [_out]
+	if err:
+		ret += [_err]
+	if code:
+		ret += [_code]
+
+	ret = tuple(ret)
+	if len(ret) == 1:
+		ret = ret[0]
+
+	return ret
 
 def bash(cmd, from_dir=None, crash=False, stderr=False, strip=True):
 	out, err = run(cmd, from_dir=from_dir, stderr=True, strip=strip) # [sic]
@@ -1062,6 +1159,15 @@ def fix_path(path):
 def ls(path='.', abs=None, rel=None, t=True, pat=None):
 	if abs and rel:
 		print('\n[grey50]ll.ls got both abs and rel; choosing abs[grey50]\n')
+
+	if '*' in (pp:=path.split('/')[-1]):
+		pat = pp.replace('*', '.*')
+		path = os.path.dirname(path)
+		if path == '':
+			path = '.'
+
+	if pat is not None:
+		pat = ('^' if (not pat.startswith('^')) else '') + pat + ('$' if (not pat.endswith('$')) else '')
 
 	if path.startswith('~'):
 		path = path.replace('~', os.environ.get('HOME'), 1)
@@ -1215,10 +1321,14 @@ def andify(l, quote='', oxford=True):
 def only_digits(s):
 	return ''.join(c for c in s if c in '0123456789')
 
-def track(i, total=None, title=None, console=None):
+def track(i, total=None, title='', console=None, init=0, transient=False):
 	global _ll_global_console
 	if console is None:
 		console = _ll_global_console
+	if hasattr(i, '__len__'):
+		total = len(i)
+	elif hasattr(i, '__length_hint__'):
+		total = i.__length_hint__()
 
 	kwargs = {}
 	if total is not None:
@@ -1226,7 +1336,12 @@ def track(i, total=None, title=None, console=None):
 	if title is not None:
 		kwargs['title'] = title
 	
-	return _track(i, total=total, description=title, console=console)
+	# TODO: better initial progress than total-init
+	return _track(i, total=total-init, description=title, console=console, transient=transient)
+
+
+def flat_track(*a, **kw):
+	return list(track(*a, **kw))
 
 
 class gen:
@@ -1326,7 +1441,18 @@ def dt(x):
 	if isinstance(x, int) or isinstance(x, float):
 		return dt(datetime.utcfromtimestamp(x))
 
+	# For dates like 2026-05-19T20:00:05.9017741Z (in the tcgcsv data),
+	# Python doesn't like the 7 digits at the end there; it only wants 6
+	if isinstance(x, str):
+		x = re.sub(
+			r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.)(\d{6})\d+(Z)$',
+			r'\1\2\3',
+			x,
+		)
+
 	for fstr in (
+		'%Y-%m-%dT%H:%M:%S.%fZ',
+		'%Y-%m-%dT%H:%M:%S',
 		'%Y-%m-%d %H:%M:%S',
 		'%Y/%m/%d %H:%M:%S',
 		'%Y-%m-%d %H:%M',
@@ -1347,9 +1473,16 @@ def dt(x):
 
 _ll_global_dotenv_found = False
 def env(var, loc=None, refresh_global=False, crash=False):
+	global _ll_global_dotenv_found
+
 	assert(loc is None or refresh_global is False)
 
-	global _ll_global_dotenv_found
+	for _base in (here(), os.getcwd()):
+		if fexists(ospj(_base, '.env')):
+			load_dotenv(ospj(_base, '.env'))
+			_ll_global_dotenv_found = True
+			return os.environ[var] if crash else os.environ.get(var)
+
 
 	if loc is not None and loc.startswith('~'):
 		loc.replace('~', os.environ['HOME'])
@@ -1587,6 +1720,15 @@ def makedirs(*a, **kw):
 
 
 @_cm
+def tmp_file(content, b=False):
+	with open(fn:=f'/tmp/{uuid(dash=False)}', 'w'+'b'*b+'+') as f:
+		f.write(content)
+	yield fn
+	os.remove(fn)
+tmpfile=tmp_file
+
+
+@_cm
 def tmp_dir(name=None, persist=False):
 	if name is not None:
 		dst = ospj('/tmp', name)
@@ -1611,13 +1753,13 @@ tmpdir = tmp_dir
 def add_newline_if_missing(fn):
 	if not fexists(fn):
 		raise Exception(f"Target {fn} does not exist")
-	if last_line(fn)[-1] != '\n':
+	if len(las:=last_line(fn))>0 and las[-1] != '\n':
 		with open(fn, 'a') as f:
 			f.write('\n')
 
 
-def sel(url):
-	with Sel.tmp(url, headless=True, linger=False) as sel:
+def sel(url, headers=None):
+	with Sel.tmp(url, headers=None, headless=True, linger=False) as sel:
 		return sel.src()
 
 
@@ -1723,57 +1865,78 @@ silence = silent
 with silent():
 	from seleniumwire import webdriver
 from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.chromium.options import ChromiumOptions
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 class Sel:
-	def __init__(self, url=None, headless=False, linger=False, download_dir=None, cookies=None, headers=None):
+	def __init__(self, url=None, headless=True, linger=False, download_dir=None, cookies=None, headers=None, delay=0, user_agent=None):
 		self.headless = headless
 		self.last_loaded_url = None
+		self.delay = delay
+		self.user_agent = user_agent
 
-		if download_dir is None:
-			download_dir = os.path.join(os.environ['HOME'], 'Downloads')
+		self.download_dir = download_dir
+		if self.download_dir is None:
+			# self.download_dir = os.path.join(os.environ['HOME'], 'Downloads')
+			self.download_dir = f'/tmp/{uuid()}'
+			os.makedirs(self.download_dir)
 
 		self.options = Options()
 		self.options.set_preference('permissions.default.stylesheet', 2)
 		self.options.set_preference('permissions.default.image', 2)
 		self.options.set_preference('browser.download.folderList', 2)
 		self.options.set_preference('browser.download.manager.showWhenStarting', False)
-		self.options.set_preference('browser.download.dir', os.path.abspath(download_dir))
+		self.options.set_preference('browser.download.dir', os.path.abspath(self.download_dir))
 		self.options.set_preference('devtools.jsonview.enabled', False)
 		self.options.set_preference('browser.helperApps.neverAsk.saveToDisk', 'text/csv')
 		if self.headless:
-			self.options.add_argument("--headless")
-
+			self.options.add_argument('--headless')
+		if self.user_agent is not None:
+			self.options.set_preference('general.useragent.override', self.user_agent)
 		self.driver = webdriver.Firefox(options=self.options)
 
+		'''
+		self.options = ChromiumOptions()
+		if self.user_agent is not None:
+			self.options.add_argument(f'--user-agent={self.user_agent}')
+		uc.TARGET_VERSION = 146
+		self.options.browser_executable_path = '/Users/lane/Downloads/chr/Google Chrome for Testing'
+		self.driver = uc.Chrome(version_main=146, options=self.options, headless=self.headless, use_subprocess=False)
+		'''
 
 
-		self.interceptor = None
+
+		self._interceptor = None
 		self.headers = headers
-		self.cookies = Sel.parse_cookies(cookies, dictate=False)
+		if isinstance(cookies, dict):
+			self.cookies = cookies
+		else:
+			self.cookies = Sel.parse_cookies(cookies, dictate=False)
 
 		if self.headers is not None:
 			def interceptor(request):
 				for k, v in self.headers.items():
 					request.headers[k] = v
-			if self.interceptor is None:
-				self.interceptor = interceptor
+			if self._interceptor is None:
+				self._interceptor = interceptor
 			else:
-				self.interceptor = lambda *a,**kw: interceptor(self.interceptor(*a,**kw))
+				_x = self._interceptor
+				self._interceptor = (lambda _y: lambda *a,**kw: interceptor(_y(*a,**kw)))(_x)
 
 		if self.cookies is not None:
 			def interceptor(request):
 				request.headers['Cookie'] = self.cookies
-			if self.interceptor is None:
-				self.interceptor = interceptor
+			if self._interceptor is None:
+				self._interceptor = interceptor
 			else:
-				self.interceptor = lambda *a,**kw: interceptor(self.interceptor(*a,**kw))
+				_x = self._interceptor
+				self._interceptor = (lambda _y: lambda *a,**kw: interceptor(_y(*a,**kw)))(_x)
 
-		if self.interceptor is not None:
-			self.driver.request_interceptor = self.interceptor
+		if self._interceptor is not None:
+			self.driver.request_interceptor = self._interceptor
 
 
 
@@ -1811,11 +1974,12 @@ class Sel:
 	@staticmethod
 	@_cm
 	def tmp(*a, **kw):
+		sel = None
 		try:
 			sel = Sel(*a, **kw)
 			yield sel
 		finally:
-			if 'linger' not in kw or not kw['linger']:
+			if (sel is not None) and ('linger' not in kw or not kw['linger']):
 				sel.close()
 
 
@@ -1844,12 +2008,16 @@ class Sel:
 		return f'//{tag}' + ''.join(attrs)
 
 
-	def el(self, wait=10, **kw):
-		return WebDriverWait(self.driver, wait).until(
-			EC.presence_of_element_located((By.XPATH, self.xpath(**kw))))
+	def el(self, wait=30, xpath=None, **kw):
+		if xpath is not None:
+			return WebDriverWait(self.driver, wait).until(
+				EC.presence_of_element_located((By.XPATH, xpath)))
+		else:
+			return WebDriverWait(self.driver, wait).until(
+				EC.presence_of_element_located((By.XPATH, self.xpath(**kw))))
 
 
-	def els(self, *a, poll=1, wait=10, min_num=1, strict=True, **kw):
+	def els(self, *a, poll=1, wait=30, min_num=1, strict=True, **kw):
 		found = []
 
 		waited = 0
@@ -1872,18 +2040,26 @@ class Sel:
 
 
 	def click(self, **kw):
+		if self.delay:
+			time.sleep(random.random() * self.delay)
 		self.el(**kw).click()
 
 
 	def click_at(self, **kw):
+		if self.delay:
+			time.sleep(random.random() * self.delay)
 		ActionChains(self.driver).move_to_element_with_offset(self.el(**kw), 5, 5).click().perform()
 
 
 	def type(self, txt, **kw):
+		if self.delay:
+			time.sleep(random.random() * self.delay)
 		self.el(**kw).send_keys(txt)
 
 
 	def type_at(self, txt, **kw):
+		if self.delay:
+			time.sleep(random.random() * self.delay)
 		ActionChains(self.driver).move_to_element(self.el(**kw)).click().send_keys(txt).perform()
 
 
@@ -1908,6 +2084,97 @@ class Sel:
 			return
 		self.driver.quit()
 		self._closed = True
+
+
+	def dl(
+		self,
+		url,
+		dst_dir=None,
+		dst_name=None,
+		b=False,
+		clobber=False,
+		ignore=False,
+		ensure_newline=True,
+		tries=10,
+		wait=1,
+		max_wait=30,
+		backoff_after=None,
+		cookies=None,
+		headers=None,
+	):
+		# TODO: fix
+		assert(dst_dir is None) 
+		dst_dir = self.download_dir
+
+		# Input checks
+		if clobber and ignore:
+			raise Exception(f"You can't pass both clobber=True and ignore=True, bro")
+		if (dst_dir is not None) and (dst_name is not None):
+			_dst = ospj(dst_dir, dst_name)
+			if b:
+				raise Exception(f"You asked for download destination {_dst}, but you also passed b=True, which means you want the file in-memory in bytes. So which is it?")
+			if fexists(_dst):
+				if not clobber:
+					if ignore:
+						return
+					else:
+						raise Exception(f"Destination name {_dst} already exists" + ' (and is a directory, for that matter)'*isdir(dst) + "; pass clobber=True if you're OK with that, or ignore=True to do nothing instead")
+				elif clobber and isdir(_dst):
+					raise Exception(f"Destination name {_dst} already exists as a directory")
+		elif (dst_dir is not None) and b:
+			raise Exception(f"You asked for download destination directory {dst}, but you also passed b=True, which means you want the file in-memory in bytes. So which is it?")
+		elif (dst_name is not None) and b:
+			raise Exception(f"You asked for download destination name {dst}, but you also passed b=True, which means you want the file in-memory in bytes. So which is it?")
+
+		# Function to do the actual downloading
+		# (we may or may not call it in a context manager, so it's separated out)
+		def _dl(dst_dir, dst_name=None):
+			# with Sel.tmp(headless=headless, linger=False, download_dir=dst_dir, cookies=cookies, headers=headers) as sel:
+			before = ls(dst_dir)
+			self.load_new_window(url) # to prevent hanging
+
+			wait_secs = wait
+			pre_backoff_ticks = 0
+			for _ in range(tries):
+				if len(after:=ls(dst_dir)) > len(before):
+					break
+				sleep(wait_secs)
+				pre_backoff_ticks += 1
+				if backoff_after is not None:
+					if pre_backoff_ticks >= backoff_after:
+						wait_secs = min(max_wait, wait_secs*2)
+			if len(after) <= len(before):
+				raise Exception(f"Couldn't download {url}")
+
+			fn = ospj(dst_dir, after[-1])
+
+			if dst_name is not None:
+				# This could theoretically just be force=True, since, if the file
+				# exists, we're only here if clobber=True, but I think it's better
+				# to be redundant because I'm not very smart
+				mv(fn, (nfn:=ospj(dst_dir, dst_name)), force=clobber)
+				fn = nfn
+
+			return fn
+
+		def _handle_dl(fn):
+			if ensure_newline:
+				add_newline_if_missing(fn)
+			if dst_name is None:
+				# Return the downloaded file in memory & delete the file
+				return read(fn, b=b)
+			else:
+				# Return the downloaded file's path
+				return fn
+
+		# Download the file
+		if dst_dir is None:
+			with tmpdir() as dst_dir:
+				fn = _dl(dst_dir, dst_name)
+				return _handle_dl(fn)
+		else:
+			fn = _dl(dst_dir, dst_name)
+			return _handle_dl(fn)
 
 
 def norm(s, ok=alpha+nums+'_'):
@@ -2231,5 +2498,581 @@ def safe_int(s, none=False):
 	except:
 		return s if not none else None
 
-def capitalize(s):
-	return s[0].upper() + s[1:].lower()
+def capitalize(s, words=True):
+	if len(s)==0:
+		return ''
+
+	if words and ' ' in s:
+		ws = s.split(' ')
+		return ' '.join([capitalize(w, words=False) for w in ws])
+	else:
+		return s[0].upper() + s[1:].lower()
+
+
+def ceil(x):
+	return x if int(x)==x else int(x)+1
+
+def floor(x):
+	return int(x)
+
+def round(x):
+	return int(x+0.5)
+
+
+def centering(l, r):
+	# This is for estimating card centering,
+	# so we'll round pessimistically
+	l,r=l*100/(l+r),r*100/(l+r)
+	l,r=min(l,r),max(l,r)
+	l,r=floor(l),ceil(r)
+	col = 'red' if l<45 else 'green'
+	print(f'[{col}]{l}[/{col}] / [{col}]{r}[/{col}]')
+	print(f'\t{int(l*100/50)}% (need 90%)')
+
+
+def recdict(dd):
+	return {
+		k: (recdict(v) if isinstance(v, defaultdict) else v)
+			for k, v in dd.items()
+	}
+
+
+_ll_global_memcache = {}
+def memcache(f):
+	global _ll_global_memcache
+	def wrapper(*a, **kw):
+		if (key:=cache_key(f,a,kw)) not in _ll_global_memcache:
+			_ll_global_memcache[key] = f(*a, **kw)
+		return _ll_global_memcache[key]
+	return wrapper
+
+
+class pbar:
+	def __init__(self, title='', total=None, transient=False, console=None, dummy=False):
+		global _ll_global_console
+
+		self._dummy = dummy
+		if self._dummy:
+			return
+
+		self._title = title
+		self._total = total
+		self._cur = 0
+		self._prog = Progress(transient=transient, console=console or _ll_global_console)
+		self._task = self._prog.add_task(self._title, total=self._total)
+		self._started = False
+		self._stopped = False
+
+	def __iadd__(self, q):
+		if self._dummy or self._stopped:
+			return self
+		if not self._started:
+			self.start()
+		self._cur += q
+		self._prog.update(self._task, advance=q)
+		if self._cur >= self._total:
+			self.stop()
+
+		return self
+
+	def set_title(self, title):
+		if self._dummy or self._stopped:
+			return
+		self._title = title
+		self._prog.update(self._task, description=title)
+
+	def start(self):
+		if self._dummy or self._stopped or self._started:
+			return
+		self._started = True
+		self._prog.start()
+
+	def stop(self):
+		if self._dummy or self._stopped:
+			return
+		self._stopped = True
+		if self._cur < self._total:
+			self.__iadd__(self._total-self._cur)
+		self._prog.stop()
+
+	def close(self):
+		self.stop()
+
+
+def chunks(it, n=1, stream=True):
+	def _chit():
+		buf = []
+		for i, e in enumerate(it):
+			buf.append(e)
+			if len(buf) >= n:
+				yield buf
+				buf = []
+		if buf:
+			yield buf
+
+	ret = _chit()
+	if (t:=is_coll(it)):
+		ret = t(ret)
+	elif not stream:
+		ret = list(ret)
+	return ret
+chunk = chunks
+
+
+def indent(s, n=1):
+	return '\n'.join([(('\t'*n)+line) for line in lines(s)])
+
+
+def curl2url(curl):
+	if fexists(curl):
+		curl = read(curl)
+	if not curl.startswith('curl'):
+		err(f"input doesn't start with the word [grey70]curl[/grey70]")
+	curl = curl.replace('\\', '')
+
+	return regf("curl '(.*)'")(curl)
+
+
+def curl2headers(curl):
+	if fexists(curl):
+		curl = read(curl)
+	if not curl.startswith('curl'):
+		err(f"input doesn't start with the word [grey70]curl[/grey70]")
+	curl = curl.replace('\\', '')
+
+	headers = dict(regf("-H '(.*): (.*)'", all=True)(curl))
+
+	return headers
+
+
+def curl2cookies(curl):
+	if fexists(curl):
+		curl = read(curl)
+	cookies = {}
+	for line in lines(curl):
+		if line.startswith('-b'):
+			content = "'".join(line.split("'")[1:-1])
+			kvs = content.split('; ')
+			for kv in kvs:
+				spl = kv.split('=')
+				k = spl[0]
+				v = '='.join(spl[1:])
+				cookies[k] = unquote(v)
+	return cookies
+
+
+def curl2any(curl, tag=None):
+	if tag is None:
+		raise Exception(f"You can't pass tag=None")
+
+	if fexists(curl):
+		curl = read(curl)
+	ret = []
+	for line in lines(curl):
+		if line.startswith(f'-{tag}') or line.startswith(f'--{tag}'):
+			content = "'".join(line.split("'")[1:-1])
+			ret.append(content)
+
+	return ret
+
+
+def curl(cmd):
+	if fexists(cmd):
+		cmd = read(cmd)
+	cmd = '\n'.join(l.replace('\\', '').strip() for l in cmd.split('\n') if l.replace('\\', '').strip())
+
+	url = curl2url(cmd)
+	headers = curl2headers(cmd)
+	# cookies = curl2cookies(cmd)
+	cookies = '; '.join([l.split('-b')[-1].strip() for l in lines(cmd) if '-b ' in l])
+
+	print(sel_dl(url, headers=headers, cookies=cookies, headless=False))
+
+
+@_cm
+def loc(d):
+	pwd = os.getcwd()
+	try:
+		os.chdir(d)
+		yield
+	finally:
+		os.chdir(pwd)
+
+
+def clear():
+	print(run('clear'))
+
+
+def retry(tries=3, try_wait=3, v=False, ctrl_c=True):
+	def _1(f):
+		@wraps(f)
+		def _2(*a, **kw):
+			for i in range(tries):
+				try:
+					return f(*a, **kw)
+				except Exception as e:
+					if i==tries-1 or isinstance(e, KeyboardInterrupt):
+						raise e
+					else:
+						if v:
+							print(e)
+						time.sleep(try_wait)
+		return _2
+	return _1
+
+
+class file:
+	def __init__(self, path):
+		path = fix_path(path)
+		self.path = path if path.startswith('/') else os.path.join(os.getcwd(), path)
+
+
+	def write(self, txt, b=False, nl=False, safe=False, create=False):
+		if safe and os.path.exists(self.path):
+			raise Exception(f"safe=True and exists({self.path})")
+		if create:
+			os.makedirs(os.path.dirname(self.path), exist_ok=True)
+
+		if nl and txt and txt[-1] != '\n':
+			txt += '\n'
+
+		mode = 'wb+' if b else 'w+'
+		with open(self.path, mode) as f:
+			f.write(txt)
+
+
+	def from_url(self, url, pbar=False, b=False, **kwargs):
+		self.write('', **kwargs) # to proc warnings/errors before downloading
+		kwargs['safe'] = False # bc we just checked by writing
+		self.write(lget(url, b=b, prog=pbar), b=b, **kwargs)
+
+
+	def append(self, txt, b=False, nl=False):
+		if nl:
+			if txt.split('\n')[-1].strip():
+				txt += '\n'
+			if os.path.exists(self.path) and (ex:=self.read()) and ex[-1] != '\n':
+				txt = f'\n{txt}'
+
+		mode = 'ab+' if b else 'a+'
+		with open(self.path, mode) as f:
+			f.write(txt)
+
+
+	def read(self, b=False, fmt=None):
+		mode = 'rb' if b else 'r'
+		with open(self.path, mode) as f:
+			txt = f.read()
+
+		match fmt:
+			case 'json':
+				return _json.loads(txt)
+			case 'csv':
+				return csv(txt)
+			case _:
+				return txt
+
+
+	def lines(self, stream=False, strip=True):
+		def _itr():
+			with open(self.path, 'r') as f:
+				while True:
+					try:
+						line = next(f)
+					except StopIteration:
+						break
+					if strip and not (line:=line.strip()):
+							continue
+					yield line
+
+		return _itr() if stream else list(_itr())
+
+
+def lget(url, b=False, prog=False, stream=False):
+	def _itr():
+		resp = requests.get(url, stream=True)
+
+		total = int(resp.headers.get('content-length', 0))
+		blk = 1024
+
+		p = pbar(total=total, dummy=(not prog))
+		for chunk in resp.iter_content(blk):
+			if total==0 and (total:=resp.headers.get('content-length', 0)):
+				p = pbar(total=total, dummy=(not prog))
+			if total > 0:
+				p += len(chunk)
+			yield chunk
+		if total > 0:
+			p.stop()
+
+	if stream:
+		return _itr()
+
+	_resp = []
+	for _chunk in _itr():
+		_resp.extend(_chunk)
+	_resp = bytes(_resp)
+
+	return _resp if b else _resp.decode()
+
+
+def be(x, t):
+	if isinstance(x, type) and not isinstance(t, type):
+		x,t=t,x
+	return isinstance(x, t)
+
+
+def wrap(s, width=None, console=None):
+	if width is None:
+		width = os.get_terminal_size().columns - 1
+
+	if console is None:
+		global _ll_global_console
+		console = _ll_global_console
+
+	return '\n'.join(map(str, list(Text(s).wrap(width=width, console=console))))
+
+
+def is_coll(x):
+	for t in (list, tuple, set):
+		if be(x, t):
+			return t
+	return False
+
+
+def sort(l, n=False, key=lambda x:x, reverse=False):
+	_l, l = l, list(l) # back up the orig j.i.c.
+
+	_proc = lambda r: ((lambda z: type(_l)(z) if is_coll(_l) else z)(r[::-1] if reverse else r))
+
+	if len(l) == 0:
+		return collify(l) # in case it wouldn't be a copy
+
+	if not n:
+		return _proc(sorted(l, key=key))
+
+	# From here on out, we're sorting numerical
+	# components first, then strings
+	_num = lambda x: be(x, float) or be(x, int) or (be(x, str) and x.replace('.','').isnumeric())
+
+	if is_coll(key(l[0])):
+		# Sorting by composite keys
+
+		# Group by length
+		'''
+			Shape:
+
+			{
+				1: [
+					(orig_array_idx, (sort_key_col_1,)),
+					(orig_array_idx, (sort_key_col_1,)),
+				],
+				2: [
+					(orig_array_idx, (sort_key_col_1, sort_key_col_2)),
+					(orig_array_idx, (sort_key_col_1, sort_key_col_2)),
+				],
+			}
+		'''
+		keys = map(key, l)
+		lengroups = dict(sorted(agg(list(enumerate(keys)), key=lambda x: len(x[1])).items(), key=nth(0), reverse=reverse))
+
+		final_idcs = []
+		# for each length of sort key tuple
+		for ln, tups in lengroups.items():
+			# remember: tups are metatups of (orig_idx, tup)
+
+			# for each item in the sort key tuple (reverse-wise)
+			for i in range(ln-1, -1, -1):
+				# separate nums and non-nums
+				# note: j here is the tup's index *within this length group*;
+				# the idx within the *original input* (since it's a key) is inertly
+				# preserved within each entry
+				# TODO: for loop to avoid second pass for nons?
+				nums = [(j, float(x[1][i])) for j, x in enumerate(tups) if _num(x[1][i])]
+				nons = [(j, x[1][i]) for j, x in enumerate(tups) if not _num(x[1][i])]
+
+				# Sort separately
+				nums = sorted(nums, key=nth(1), reverse=reverse)
+				nons = sorted(nons, key=nth(1), reverse=reverse)
+
+				# Recombine and project back onto tups
+				comb = (nons+nums) if reverse else (nums+nons)
+				tups = [tups[idx] for idx in [x[0] for x in (nums+nons)]]
+
+			# this length group has now been sorted by each field,
+			# so we'll add the original indices, in the new order,
+			# to the final idx list
+			final_idcs.extend([x[0] for x in tups])
+
+		# now just reorder the input array and we're done!
+		return _proc([l[idx] for idx in final_idcs])
+	
+	else:
+		# OK, here is much easier: we're just sorting by
+		# scalar keys
+		nums = [(i, float(x)) for i, x in enumerate(l) if _num(x)]
+		nons = [(i, x) for i, x in enumerate(l) if not _num(x)]
+		idcs = [x[0] for x in sorted(nums,key=nth(1))+sorted(nons,key=nth(1))]
+		return _proc([l[idx] for idx in idcs])
+
+	# that wasn't so bad was it
+	# 😭
+
+
+def nsort(*a, **kw):
+	return sort(*a, **{**kw, 'n': True})
+
+
+def clean(l):
+	if be(l, str):
+		return l.strip()
+	elif (t:=is_coll(l)):
+		return t(e for e in l if clean(e))
+	else:
+		try:
+			return [e for e in l if clean(e)]
+		except TypeError:
+			return l
+
+
+def hex2rgb(x):
+	x = x.replace('#', '').lower()
+	x = [x[i:i+2] for i in range(0,len(x),2)]
+	return tuple(int(e, 16) for e in x)
+
+
+def rgb2hex(*a):
+	if len(a) == 1:
+		r,g,b = a[0]
+	else:
+		r,g,b = a
+
+	return f'#{r:02x}{g:02x}{b:02x}'
+	
+
+
+def triplet_to_hex(t):
+	return 
+
+_ll_rich_colors = None
+def colors():
+	global _ll_rich_colors
+
+	if _ll_rich_colors is None:
+		_ll_rich_colors = {}
+		for name, num in ANSI_COLOR_NAMES.items():
+			t = (DEFAULT_TERMINAL_THEME.ansi_colors if num<16 else EIGHT_BIT_PALETTE)[num]
+			_ll_rich_colors[name] = f'#{t.red:02x}{t.green:02x}{t.blue:02x}'
+		# _ll_rich_colors = {k:_ll_rich_colors[k] for k in sorted(_ll_rich_colors.keys())}
+
+	return _ll_rich_colors
+
+
+def color(c):
+	return colors()[c]
+
+
+def topsort(l, is_child=lambda c,p:False):
+	buf = l[::]
+	take = []
+	while buf:
+		for i, e1 in enumerate(buf):
+			for j, e2 in enumerate(buf):
+				if i==j:
+					continue
+				if is_child(e2, e1):
+					break
+			# e1 has no children
+			take.append(e1)
+			buf.remove(e1)
+			break
+
+	return take
+
+
+@_cm
+def traceback():
+	try:
+		yield
+	except Exception as e:
+		print(_traceback.format_exc())
+
+
+def hint(i, n):
+	if be(i, int) and not be(n, int):
+		i,n=n,i
+	t = type(i)
+	try:
+		class _(t):
+			def __init__(self, i, n):
+				super().__init__(i)
+				self.n = n
+			def __length_hint__(self):
+				return self.n
+		return _(i, n)
+	except:
+		class _:
+			def __init__(self, o, n):
+				self.o = iter(o)
+				self.n = n
+			def __length_hint__(self):
+				return n
+			def __next__(self):
+				return next(self.o)
+			def __iter__(self):
+				return self
+		return _(i, n)
+
+
+_ll_scrylen = None
+def scryfall():
+	fn = here('scryfall.json')
+
+	global _ll_scrylen
+	if _ll_scrylen is None:
+		_ll_scrylen = wc_l(fn)
+
+	def _it():
+		for line in track(lines(fn, stream=True), total=_ll_scrylen):
+			nfs = {'foil': 'Foil', 'etched': 'Etched', 'nonfoil': ''}
+
+			if not line.startswith('{'):
+				continue
+			if line.endswith(','):
+				line = line[:-1]
+
+			yield json(line)
+
+	return hint(_it(), _ll_scrylen)
+
+
+def coalesce(*a):
+	if len(a) == 1 and is_coll(a[0]):
+		a = a[0]
+
+	for e in a:
+		if e is not None:
+			return e
+
+	return None
+
+
+def sqlite(dbfn, autocommit=True):
+	conn = sqlite3.connect(dbfn)
+	def _():
+		try:
+			if autocommit:
+				conn.commit()
+		except:
+			pass
+		try:
+			conn.close()
+		except:
+			pass
+	atexit.register(_)
+	conn.row_factory = lambda cur, row: {
+		col[0]: row[i]
+			for i, col in enumerate(cur.description)
+	}
+
+	return lambda q, params=None: conn.execute(*([q]+([params] if params else []))).fetchall()
