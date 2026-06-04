@@ -33,7 +33,7 @@ from base64 import b64encode, b64decode
 from bs4 import BeautifulSoup as Soup
 from collections import defaultdict, namedtuple
 from contextlib import contextmanager as _cm, redirect_stderr, redirect_stdout
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from datetime import timedelta as td
 from dotenv import find_dotenv, load_dotenv
 from functools import wraps
@@ -866,6 +866,11 @@ def resplit(pat, s, intuit_f=True, multiline=False):
 		return re.split(pat, s)
 
 def map(f, x):
+	if type(f)==type(range(1)):
+		f = list(f)
+	if type(x)==type(range(1)):
+		x = list(x)
+
 	if callable(x) and not callable(f):
 		f,x=x,f
 
@@ -1321,14 +1326,29 @@ def andify(l, quote='', oxford=True):
 def only_digits(s):
 	return ''.join(c for c in s if c in '0123456789')
 
-def track(i, total=None, title='', console=None, init=0, transient=False):
+_ll_global_track_pbars = {}
+def track(i, id=None, total=None, title='', title_len=20, console=None, init=0, transient=False):
 	global _ll_global_console
+
+	global _ll_global_track_pbars
+
 	if console is None:
 		console = _ll_global_console
 	if hasattr(i, '__len__'):
 		total = len(i)
 	elif hasattr(i, '__length_hint__'):
 		total = i.__length_hint__()
+
+	_pbar = pbar(
+		id=id,
+		total=total-(init or 0),
+		title=title,
+		title_len=title_len,
+		console=console,
+		transient=transient,
+	)
+
+	_ll_global_track_pbars[id] = _pbar
 
 	kwargs = {}
 	if total is not None:
@@ -1337,7 +1357,33 @@ def track(i, total=None, title='', console=None, init=0, transient=False):
 		kwargs['title'] = title
 	
 	# TODO: better initial progress than total-init
-	return _track(i, total=total-init, description=title, console=console, transient=transient)
+	def _ret(__pbar):
+		try:
+			for x in i:
+				__pbar += 1
+				yield x
+		finally:
+			track_close(id)
+			
+	return _ret(_pbar)
+
+def track_close(id):
+		try:
+			_ll_global_track_pbars[id].stop()
+		except:
+			pass
+		try:
+			del _ll_global_track_pbars[id]
+		except:
+			pass
+
+def track_title(s, id=None):
+	global _ll_global_track_pbars
+
+	if id is None:
+		id = list(_ll_global_track_pbars.keys())[-1]
+	_ll_global_track_pbars[id].set_title(s)
+title_track = track_title # 🎧
 
 
 def flat_track(*a, **kw):
@@ -1865,6 +1911,7 @@ silence = silent
 with silent():
 	from seleniumwire import webdriver
 from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.chromium.options import ChromiumOptions
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.common.by import By
@@ -1896,7 +1943,7 @@ class Sel:
 			self.options.add_argument('--headless')
 		if self.user_agent is not None:
 			self.options.set_preference('general.useragent.override', self.user_agent)
-		self.driver = webdriver.Firefox(options=self.options)
+		self.driver = webdriver.Firefox(options=self.options, service=Service("/opt/homebrew/bin/geckodriver"))
 
 		'''
 		self.options = ChromiumOptions()
@@ -2548,14 +2595,18 @@ def memcache(f):
 
 
 class pbar:
-	def __init__(self, title='', total=None, transient=False, console=None, dummy=False):
+	def __init__(self, id=None, title='', title_len=20, total=None, transient=False, console=None, dummy=False, init=0):
 		global _ll_global_console
+
+		self.id = id or uuid()
 
 		self._dummy = dummy
 		if self._dummy:
 			return
 
-		self._title = title
+		self._title_len = title_len
+		self._title = self.trim_title(title)
+
 		self._total = total
 		self._cur = 0
 		self._prog = Progress(transient=transient, console=console or _ll_global_console)
@@ -2575,11 +2626,17 @@ class pbar:
 
 		return self
 
+	def trim_title(self, title):
+		t = title[:self._title_len]
+		if len(t) < self._title_len:
+			t += ' ' * (self._title_len-len(t))
+		return t
+
 	def set_title(self, title):
 		if self._dummy or self._stopped:
 			return
-		self._title = title
-		self._prog.update(self._task, description=title)
+		self._title = self.trim_title(title)
+		self._prog.update(self._task, description=self._title)
 
 	def start(self):
 		if self._dummy or self._stopped or self._started:
@@ -3075,4 +3132,68 @@ def sqlite(dbfn, autocommit=True):
 			for i, col in enumerate(cur.description)
 	}
 
-	return lambda q, params=None: conn.execute(*([q]+([params] if params else []))).fetchall()
+	return lambda q, params=None: list(conn.execute(*([q]+([params] if params else []))).fetchall())
+
+
+def db_tuple(l):
+	def _(e):
+		if isinstance(e, str):
+			x = e.replace("'", "''")
+			return f'"{x}"'
+		else:
+			return str(e)
+
+	return '(' + ', '.join([_(e) for e in l]) + ')'
+
+
+
+
+
+'''
+def _old_track(i, total=None, title='', console=None, init=0, transient=False):
+	global _ll_global_console
+	if console is None:
+		console = _ll_global_console
+	if hasattr(i, '__len__'):
+		total = len(i)
+	elif hasattr(i, '__length_hint__'):
+		total = i.__length_hint__()
+
+	kwargs = {}
+	if total is not None:
+		kwargs['total'] = total
+	if title is not None:
+		kwargs['title'] = title
+	
+	# TODO: better initial progress than total-init
+	return _track(i, total=total-init, description=title, console=console, transient=transient)
+'''
+
+
+def from_unix(ts):
+	if be(ts, str) and ts.replace('.', '').isnumeric():
+		ts = float(ts)
+	if be(ts, float):
+		ts = int(ts)
+	
+	if not be(ts, int):
+		raise Exception(f"couldn't interpret {ts} as an int")
+
+	if len(str(ts)) < 10:
+		raise Exception(f"{ts} is too short to be a Unix timestamp")
+
+	while len(str(ts)) > 10:
+		ts //= 10
+	while len(str(ts)) < 10:
+		ts *= 10
+
+	return datetime.utcfromtimestamp(ts)
+
+
+def to_unix(dt, millis=False):
+	return int((dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).timestamp() * (1000 if millis else 1))
+
+
+
+
+
